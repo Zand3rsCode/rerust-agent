@@ -1,0 +1,7 @@
+/dist/
+/rerust-agent
+*.test
+*.out
+# Signing keys never go into the repo.
+*.key
+*.sec
