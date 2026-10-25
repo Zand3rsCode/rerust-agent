@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.4 - 2026-10-25
+- Fix: `install.sh` v0.2.3 stopped with "this copy of install.sh has no version" - building the release had also
+  changed its own version check. The check now looks at the version's form, and the release build changes only the
+  `VERSION=` line (and tests the result).
+
 ## v0.2.3 - 2026-10-25
 - Fix: `install.sh` stopped with "could not download the agent from .../v26.04.1 LTS (Resolute Raccoon)" - Ubuntu's
   `/etc/os-release` sets `VERSION` and overwrote the installer's own. It is read separately now.

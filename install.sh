@@ -104,6 +104,10 @@ os_release() {
     )
 }
 
+# A release fills in VERSION (scripts/release.sh replaces only that line). Checked by its form, never by comparing
+# with the placeholder: the release's replacement would change that text too (v0.2.3 stopped every install).
+has_version() { [[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; }
+
 # The port in the installed config ("listen": ":8085"), or nothing.
 last_port() {
     sed -nE 's/^[[:space:]]*"listen":[[:space:]]*"[^"]*:([0-9]+)".*/\1/p' "$CFG_DIR/config.json" 2>/dev/null | head -n1 || true
@@ -380,7 +384,7 @@ check_machine() {
                  warn "arm64: the agent runs, but Rust's dedicated server only exists for x86_64" ;;
         *) die "unsupported CPU $(uname -m)" ;;
     esac
-    [[ $VERSION == "@VERSION@" && -z $LOCAL_BINARY ]] && die "this copy of install.sh has no version - use the one from a release, or --version x.y.z"
+    has_version || [[ -n $LOCAL_BINARY ]] || die "this copy of install.sh has no version - use the one from a release, or --version x.y.z"
     if (( ${#PANEL_IPS[@]} == 0 )); then
         if [[ -f $CFG_DIR/config.json ]]; then
             mapfile -t PANEL_IPS < <(sed -n '/"allowed_ips"/,/]/p' "$CFG_DIR/config.json" | grep -oE '"[0-9a-fA-F:.]+(/[0-9]+)?"' | tr -d '"')
@@ -591,7 +595,7 @@ install_services() {
         chmod 644 "$file.new"
         mv -f "$file.new" "$file"
     done
-    install -d -m 755 "$(dirname "$POLKIT_RULE")"
+    [[ -d $(dirname "$POLKIT_RULE") ]] || install -d -m 755 "$(dirname "$POLKIT_RULE")"   # never change polkit's own folder
     polkit_rule >"$POLKIT_RULE.new"; chmod 644 "$POLKIT_RULE.new"; mv -f "$POLKIT_RULE.new" "$POLKIT_RULE"
     ok "wrote rerust-agent.socket/.service, rerust-server@.service, rerust-agent-update.service and the polkit rule"
     systemctl daemon-reload
