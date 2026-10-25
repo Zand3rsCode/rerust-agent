@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.5 - 2026-10-25
+- `install.sh` shows the **public** address for the panel when the machine is behind a router (it showed the
+  machine's own private address), and which ports to forward on the router. The public address comes from
+  api.ipify.org (or icanhazip.com), asked only when the machine's own address is a private one.
+
 ## v0.2.4 - 2026-10-25
 - Fix: `install.sh` v0.2.3 stopped with "this copy of install.sh has no version" - building the release had also
   changed its own version check. The check now looks at the version's form, and the release build changes only the

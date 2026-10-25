@@ -634,11 +634,41 @@ firewall() {
     say "    Extra servers use the next +10 block, e.g.: sudo ufw allow 28025,28027/udp && sudo ufw allow 28092/tcp"
 }
 
+# A private or shared address (behind a router / the provider's NAT): RFC 1918, 100.64.0.0/10, link-local.
+private_ipv4() {
+    [[ $1 =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.|169\.254\.) ]]
+}
+
+# This machine's public IPv4 as the internet sees it ("" when no service answers). Only asked when the machine's own
+# address is a private one; the services see nothing but that address.
+public_ipv4() {
+    local url ip
+    for url in https://api.ipify.org https://icanhazip.com; do
+        ip=$(curl -4 -fsS --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
+        if [[ $ip =~ ^[0-9.]+$ ]] && valid_panel_ip "$ip" && ! private_ipv4 "$ip"; then
+            printf '%s\n' "$ip"
+            return 0
+        fi
+    done
+}
+
+# LOCAL_ADDR = the address this machine uses to reach the internet; PUBLIC_ADDR = the one the panel must use (the
+# router's public one when the machine is behind a router; "" = unknown).
+machine_addresses() {
+    LOCAL_ADDR=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }' || true)
+    [[ -n $LOCAL_ADDR ]] || LOCAL_ADDR=$(hostname -I 2>/dev/null | awk '{ print $1 }' || true)
+    PUBLIC_ADDR=$LOCAL_ADDR
+    if [[ -z $LOCAL_ADDR ]] || private_ipv4 "$LOCAL_ADDR"; then
+        PUBLIC_ADDR=$(public_ipv4)
+    fi
+}
+
 pairing() {
     step "Pairing with the panel"
-    local code err addr port_part=""
-    addr=$(hostname -I 2>/dev/null | awk '{ print $1 }')
-    [[ -n $addr ]] || addr="<this machine's address>"
+    local code err addr port_part="" behind=0
+    machine_addresses
+    [[ -n $LOCAL_ADDR ]] && private_ipv4 "$LOCAL_ADDR" && behind=1
+    addr=${PUBLIC_ADDR:-"<your router's public IP>"}
     [[ $PORT != 443 ]] && port_part=":$PORT"   # 443 is https's own port: no need to write it
     if ! code=$(as_agent "$BIN" pair --config "$CFG_DIR/config.json" 2>"$TMP/pair.err"); then
         err=$(cat "$TMP/pair.err")
@@ -652,9 +682,15 @@ pairing() {
     fi
     say ""
     say "  In the panel: Settings -> Machines -> Add machine"
-    say "    Address:      https://$addr$port_part   (or its domain name / public IP)"
+    say "    Address:      https://$addr$port_part   (or a domain name pointing there)"
     say "    Pairing code: $code"
     say ""
+    if [[ $behind -eq 1 ]]; then
+        say "  This machine is behind a router (its own address is $LOCAL_ADDR). On the router, forward to $LOCAL_ADDR:"
+        say "    TCP $PORT (panel -> agent), UDP 28015 + 28017 (Rust), TCP 28082 (Rust+). Never forward 28016 (RCON)."
+        [[ -n $PUBLIC_ADDR ]] || say "    The public address could not be found out - use the router's public IP (its status page shows it)."
+        say ""
+    fi
     say "  The code works once, within 60 minutes. A new one: sudo -u $AGENT_USER $BIN pair"
 }
 
