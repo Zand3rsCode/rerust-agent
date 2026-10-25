@@ -25,11 +25,14 @@ import (
 	"github.com/Zand3rsCode/rerust-agent/internal/jail"
 )
 
-// FrameworkFolders go into a backup with the save folder and HarmonyMods (the panel's Wiper::FRAMEWORK_FOLDERS).
+// FrameworkFolders go into a backup with the save folder and HarmonyFolders (the panel's Wiper::FRAMEWORK_FOLDERS).
 var FrameworkFolders = map[string][]string{
 	"carbon": {"carbon/plugins", "carbon/plugins-disabled", "carbon/data", "carbon/configs", "carbon/lang", "carbon/logs"},
 	"oxide":  {"oxide/plugins", "oxide/plugins-disabled", "oxide/data", "oxide/config", "oxide/lang", "oxide/logs"},
 }
+
+// HarmonyFolders: the Harmony mods (code) and their own settings/data (the panel's Wiper::HARMONY_FOLDERS).
+var HarmonyFolders = []string{"HarmonyMods", "HarmonyMods_Data"}
 
 // backupSkip: caches Rust rebuilds on every start (the navmesh alone is ~100 MB per world).
 var backupSkip = []*regexp.Regexp{regexp.MustCompile(`(?i)\.navmesh$`), regexp.MustCompile(`(?i)_occlusion_\d+\.dat$`)}
@@ -49,7 +52,7 @@ func (s *Server) isBackupName(name string) bool {
 
 /* ---------- make a backup ---------- */
 
-// backup zips the save folder (minus caches), the framework's folders and HarmonyMods into <base>/_backups/<slug>.
+// backup zips the save folder (minus caches), the framework's folders, HarmonyMods and HarmonyMods_Data into <base>/_backups/<slug>.
 // The server folder is read through the jail (os.Root): a link or a swapped folder can't pull other files in.
 func (a *Agent) backup(s *Server, framework string, log func(string)) (string, int64, error) {
 	target := s.BackupDir()
@@ -63,7 +66,7 @@ func (a *Agent) backup(s *Server, framework string, log func(string)) (string, i
 	defer j.Close()
 	sources := []string{"server/" + s.SafeIdentity()}
 	sources = append(sources, FrameworkFolders[framework]...)
-	sources = append(sources, "HarmonyMods")
+	sources = append(sources, HarmonyFolders...)
 	name := s.Slug + "-" + time.Now().Format("20060102-150405") + ".zip"
 	file := target + "/" + name
 	out, err := os.OpenFile(file, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
@@ -217,14 +220,15 @@ func rootOf(rel string) string {
 	return codeRootOf(rel)
 }
 
-// isCodeRoot: plugins and HarmonyMods - restoring them runs their code on the next start, so only on request.
+// isCodeRoot: plugins and HarmonyMods - restoring them runs their code on the next start, so only on request
+// (HarmonyMods_Data is the mods' settings/data: restored always).
 func isCodeRoot(root string) bool {
 	return root == "HarmonyMods" || strings.HasSuffix(root, "/plugins") || strings.HasSuffix(root, "/plugins-disabled")
 }
 
-// codeRootOf is the framework folder (or HarmonyMods) an entry is in.
+// codeRootOf is the framework folder (or a Harmony folder) an entry is in.
 func codeRootOf(rel string) string {
-	for _, list := range [][]string{FrameworkFolders["carbon"], FrameworkFolders["oxide"], {"HarmonyMods"}} {
+	for _, list := range [][]string{FrameworkFolders["carbon"], FrameworkFolders["oxide"], HarmonyFolders} {
 		for _, root := range list {
 			if strings.HasPrefix(rel, root+"/") {
 				return root

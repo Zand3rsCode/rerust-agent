@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.2.2 - 2026-10-25
+- Backups include `HarmonyMods_Data` (the Harmony mods' own settings and data) next to `HarmonyMods`. A restore puts it
+  back always - it is data, not code (HarmonyMods itself still only when asked for).
+
 ## v0.2.1 - 2026-10-25
 - The agent's default port is now **8085** (was 443): port 443 is often taken by a website on the same machine. Use
   `https://<machine>:8085` as the machine's address in the panel; `--port` still picks another one (e.g. `--port 443`).
