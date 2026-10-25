@@ -15,7 +15,7 @@ const DefaultPath = "/etc/rerust-agent/config.json"
 // Config is the agent's settings. Secrets are not in here: the machine key's hash lives in the state folder
 // (auth.json), the panel's RCON passwords never reach the disk.
 type Config struct {
-	// Listen is the HTTPS address, e.g. ":443".
+	// Listen is the HTTPS address, e.g. ":8085" (the default; systemd's socket decides when it starts the agent).
 	Listen string `json:"listen"`
 	// BaseDir holds one folder per server (<base>/<slug>) plus _backups and _deleting.
 	BaseDir string `json:"base_dir"`
@@ -36,7 +36,7 @@ type Config struct {
 // Defaults are the values install.sh uses.
 func Defaults() Config {
 	return Config{
-		Listen:          ":443",
+		Listen:          ":8085",
 		BaseDir:         "/srv/rust",
 		StateDir:        "/var/lib/rerust-agent",
 		DepotDownloader: "/opt/depotdownloader/DepotDownloader",

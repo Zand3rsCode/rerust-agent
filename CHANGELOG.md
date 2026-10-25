@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.1 - 2026-10-25
+- The agent's default port is now **8085** (was 443): port 443 is often taken by a website on the same machine. Use
+  `https://<machine>:8085` as the machine's address in the panel; `--port` still picks another one (e.g. `--port 443`).
+  Running the installer again on a machine keeps the port it has (no `--port` needed).
+
 ## v0.2.0 - 2026-10-25
 Security fixes from a review before the first install (v0.1.0 was withdrawn the same day, never installed):
 - Game servers run as their own systemd service each (`rerust-server@<name>`), as user `rerust`, and see only their

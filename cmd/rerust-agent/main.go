@@ -78,8 +78,8 @@ func load(path string, makeState bool) config.Config {
 	return cfg
 }
 
-// listener: the socket systemd opened for us (rerust-agent.socket - so the agent needs no capability to use port
-// 443), else listen itself (development).
+// listener: the socket systemd opened for us (rerust-agent.socket - so the agent needs no capability for its port,
+// even 443), else listen itself (development).
 func listener(addr string) (net.Listener, error) {
 	if os.Getenv("LISTEN_PID") == strconv.Itoa(os.Getpid()) && os.Getenv("LISTEN_FDS") != "" {
 		n, _ := strconv.Atoi(os.Getenv("LISTEN_FDS"))

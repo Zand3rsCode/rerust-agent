@@ -6,7 +6,7 @@
 #
 # Options:
 #   --panel-ip IP        the panel's address (repeat for more); only it may reach the agent's port
-#   --port N             the agent's HTTPS port (default 443)
+#   --port N             the agent's HTTPS port (default 8085)
 #   --replace-php-agent  switch off an older ReRust (PHP) install on this machine first; its server folders in
 #                        /srv/rust stay and are taken over (same names)
 #   --no-firewall        leave the firewall alone
@@ -47,7 +47,8 @@ FW_AGENT='ReRust panel -> agent'
 FW_GAME='Rust server 1: game + query'
 FW_RUSTPLUS='Rust server 1: Rust+'
 
-PANEL_IPS=() PORT=443 REPLACE_PHP=0 FIREWALL=1 YES=0 UNINSTALL=0 DELETE_SERVERS=0 LOCAL_BINARY=""
+DEFAULT_PORT=8085
+PANEL_IPS=() PORT="" REPLACE_PHP=0 FIREWALL=1 YES=0 UNINSTALL=0 DELETE_SERVERS=0 LOCAL_BINARY=""
 
 say()  { printf '%s\n' "$*"; }
 ok()   { printf '  \033[32mok\033[0m  %s\n' "$*"; }
@@ -92,6 +93,11 @@ valid_panel_ip() {
     return 1
 }
 
+# The port in the installed config ("listen": ":8085"), or nothing.
+last_port() {
+    sed -nE 's/^[[:space:]]*"listen":[[:space:]]*"[^"]*:([0-9]+)".*/\1/p' "$CFG_DIR/config.json" 2>/dev/null | head -n1 || true
+}
+
 parse_args() {
     while (( $# > 0 )); do
         case $1 in
@@ -108,6 +114,11 @@ parse_args() {
             *) die "unknown option $1 (see --help)" ;;
         esac
     done
+    # No --port: the port of the last install (a rerun never moves a machine), else the default.
+    if [[ -z $PORT ]]; then
+        PORT=$(last_port)
+        [[ -n $PORT ]] || PORT=$DEFAULT_PORT
+    fi
     valid_port "$PORT" || die "--port must be 1 - 65535 (no leading zeros)"
     local ip
     for ip in "${PANEL_IPS[@]}"; do
@@ -152,7 +163,7 @@ Description=ReRust Agent - HTTPS port for the panel
 
 [Socket]
 # systemd opens the port, so the agent needs no capability for it (and Rust servers inherit none).
-ListenStream=$PORT
+ListenStream=${PORT:?no port}
 BindIPv6Only=both
 NoDelay=true
 
@@ -392,12 +403,12 @@ check_machine() {
         if [[ $REPLACE_PHP -eq 1 && $port_user == nginx ]]; then
             local other
             other=$(find /etc/nginx/sites-enabled -mindepth 1 -maxdepth 1 ! -name 'rerust*' -printf '%f ' 2>/dev/null || true)
-            [[ -z $other ]] || die "nginx holds port $PORT and also serves other sites ($other) - use another port for the agent: --port 8443"
+            [[ -z $other ]] || die "nginx holds port $PORT and also serves other sites ($other) - use another port for the agent: --port 8086"
             note "nginx holds port $PORT and serves only the old ReRust site"
-            confirm "Stop and switch off nginx (the old install's web server)?" || die "cancelled - use another port for the agent: --port 8443"
+            confirm "Stop and switch off nginx (the old install's web server)?" || die "cancelled - use another port for the agent: --port 8086"
             STOP_NGINX=1
         else
-            die "port $PORT is taken by $port_user. Stop that program, or use another port: --port 8443"
+            die "port $PORT is taken by $port_user. Stop that program, or use another port: --port 8086"
         fi
     fi
 
@@ -613,7 +624,7 @@ pairing() {
     local code err addr port_part=""
     addr=$(hostname -I 2>/dev/null | awk '{ print $1 }')
     [[ -n $addr ]] || addr="<this machine's address>"
-    [[ $PORT != 443 ]] && port_part=":$PORT"
+    [[ $PORT != 443 ]] && port_part=":$PORT"   # 443 is https's own port: no need to write it
     if ! code=$(as_agent "$BIN" pair --config "$CFG_DIR/config.json" 2>"$TMP/pair.err"); then
         err=$(cat "$TMP/pair.err")
         if [[ $err == *"already paired"* ]]; then
