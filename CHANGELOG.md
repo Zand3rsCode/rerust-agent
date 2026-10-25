@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.2.3 - 2026-10-25
+- Fix: `install.sh` stopped with "could not download the agent from .../v26.04.1 LTS (Resolute Raccoon)" - Ubuntu's
+  `/etc/os-release` sets `VERSION` and overwrote the installer's own. It is read separately now.
+
 ## v0.2.2 - 2026-10-25
 - Backups include `HarmonyMods_Data` (the Harmony mods' own settings and data) next to `HarmonyMods`. A restore puts it
   back always - it is data, not code (HarmonyMods itself still only when asked for).

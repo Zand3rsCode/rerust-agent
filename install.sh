@@ -93,6 +93,17 @@ valid_panel_ip() {
     return 1
 }
 
+# "<id> <version id>|<pretty name>" from os-release - read in a subshell: the file sets VERSION (and more), which
+# would overwrite the installer's own (v0.2.0 - v0.2.2 downloaded "v26.04.1 LTS (Resolute Raccoon)").
+OS_RELEASE=/etc/os-release
+os_release() {
+    (
+        # shellcheck disable=SC1090
+        . "$OS_RELEASE" 2>/dev/null || true
+        printf '%s %s|%s\n' "${ID:-}" "${VERSION_ID:-}" "${PRETTY_NAME:-unknown}"
+    )
+}
+
 # The port in the installed config ("listen": ":8085"), or nothing.
 last_port() {
     sed -nE 's/^[[:space:]]*"listen":[[:space:]]*"[^"]*:([0-9]+)".*/\1/p' "$CFG_DIR/config.json" 2>/dev/null | head -n1 || true
@@ -359,10 +370,10 @@ uninstall() {
 
 check_machine() {
     step "Checking this machine"
-    # shellcheck disable=SC1091
-    . /etc/os-release 2>/dev/null || true
-    if [[ ${ID:-} == ubuntu && ${VERSION_ID:-} == 26.04 ]]; then ok "${PRETTY_NAME}"
-    else warn "made for Ubuntu 26.04 - this is ${PRETTY_NAME:-unknown}; it may still work"; fi
+    local os
+    os=$(os_release)
+    if [[ ${os%%|*} == "ubuntu 26.04" ]]; then ok "${os#*|}"
+    else warn "made for Ubuntu 26.04 - this is ${os#*|}; it may still work"; fi
     case $(uname -m) in
         x86_64) ARCH=amd64 DD_ARCH=x64 DD_SHA256=$DD_SHA256_X64 ;;
         aarch64) ARCH=arm64 DD_ARCH=arm64 DD_SHA256=$DD_SHA256_ARM64
