@@ -1,13 +1,12 @@
 package agent
 
 import (
-	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
-	"strings"
+	"strconv"
 
 	"github.com/Zand3rsCode/rerust-agent/internal/jail"
 )
@@ -27,25 +26,21 @@ var (
 	blueprintPatterns = []*regexp.Regexp{regexp.MustCompile(`(?i)^player\.blueprints\.\d+\.db(-wal|-shm|-journal)?$`)}
 )
 
-func (s *Server) filesToDelete(blueprints bool) ([]string, error) {
-	dir := s.SaveDir()
-	if !jail.IsDir(dir) {
-		return []string{}, nil
-	}
-	real, err1 := filepath.EvalSymlinks(dir)
-	root, err2 := filepath.EvalSymlinks(s.Dir())
-	if err1 != nil || err2 != nil || !strings.HasPrefix(strings.ToLower(real), strings.ToLower(root+"/")) {
-		return nil, errors.New("Save folder is outside the server directory - refusing to wipe.")
+func (s *Server) saveRel() string { return "server/" + s.SafeIdentity() }
+
+// filesToDelete: top-level regular files of the save folder that match the patterns (through the jail).
+func (s *Server) filesToDelete(j *jail.Jail, blueprints bool) []string {
+	files := []string{}
+	if !j.IsDir(s.saveRel()) || j.IsLink("server") {
+		return files
 	}
 	patterns := mapPatterns
 	if blueprints {
 		patterns = append(append([]*regexp.Regexp{}, mapPatterns...), blueprintPatterns...)
 	}
-	files := []string{}
-	items, _ := os.ReadDir(real)
+	items, _ := j.ReadDir(s.saveRel())
 	for _, item := range items {
-		info, err := os.Lstat(real + "/" + item.Name())
-		if err != nil || !info.Mode().IsRegular() {
+		if !item.Type().IsRegular() {
 			continue // never folders, never links
 		}
 		for _, p := range patterns {
@@ -56,22 +51,23 @@ func (s *Server) filesToDelete(blueprints bool) ([]string, error) {
 		}
 	}
 	sort.Strings(files)
-	return files, nil
+	return files
 }
 
 func (a *Agent) wipePreview(w http.ResponseWriter, r *http.Request, s *Server) {
-	mapFiles, err := s.filesToDelete(false)
+	j, err := jail.Open(s.Dir())
 	if err != nil {
-		fail(w, 409, "refused", err.Error())
+		writeJSON(w, 200, map[string]any{"map": []string{}, "blueprints": []string{}})
 		return
 	}
-	all, _ := s.filesToDelete(true)
+	defer j.Close()
+	mapFiles := s.filesToDelete(j, false)
 	inMap := map[string]bool{}
 	for _, f := range mapFiles {
 		inMap[f] = true
 	}
 	extra := []string{}
-	for _, f := range all {
+	for _, f := range s.filesToDelete(j, true) {
 		if !inMap[f] {
 			extra = append(extra, f)
 		}
@@ -89,14 +85,15 @@ func (a *Agent) wipe(w http.ResponseWriter, r *http.Request, s *Server) {
 		invalid(w, "The blueprints field is required.")
 		return
 	}
-	files, err := s.filesToDelete(blueprints)
+	deleted, failed := []string{}, []string{}
+	j, err := jail.Open(s.Dir())
 	if err != nil {
-		fail(w, 409, "refused", err.Error())
+		writeJSON(w, 200, map[string]any{"deleted": deleted, "failed": failed})
 		return
 	}
-	deleted, failed := []string{}, []string{}
-	for _, name := range files {
-		if os.Remove(s.SaveDir()+"/"+name) == nil {
+	defer j.Close()
+	for _, name := range s.filesToDelete(j, blueprints) {
+		if j.Remove(s.saveRel()+"/"+name) == nil {
 			deleted = append(deleted, name)
 		} else {
 			failed = append(failed, name)
@@ -111,6 +108,26 @@ const (
 	maxCfgBytes   = 65536
 	maxIdentities = 20
 )
+
+// runningIn: the server's unit process, else (a folder another panel started) every RustDedicated whose command line
+// starts with this folder's binary.
+func (a *Agent) runningIn(slug, exe string) []int {
+	if pid := a.sup.MainPID(slug); pid > 0 {
+		return []int{pid}
+	}
+	pids := []int{}
+	entries, _ := os.ReadDir(procRoot())
+	for _, e := range entries {
+		pid, err := strconv.Atoi(e.Name())
+		if err != nil || procComm(pid) != commName {
+			continue
+		}
+		if argv := commandLine(pid); len(argv) > 0 && argv[0] == exe {
+			pids = append(pids, pid)
+		}
+	}
+	return pids
+}
 
 func folderFramework(path string) string {
 	if jail.IsDir(path+"/carbon/managed") && !jail.IsLink(path+"/carbon") {
@@ -156,7 +173,7 @@ func (a *Agent) folderInspect(w http.ResponseWriter, r *http.Request) {
 	exe := path + "/" + Executable
 	var runningInfo any
 	if jail.IsFile(exe) {
-		pids := findByExecutable(exe)
+		pids := a.runningIn(slug, exe)
 		for _, pid := range pids {
 			if argv := commandLine(pid); argv != nil {
 				// Includes its RCON password: only ever returned to the authenticated panel (it needs it).

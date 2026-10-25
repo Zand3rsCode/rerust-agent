@@ -11,11 +11,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -41,8 +41,8 @@ func (a *Agent) depotInstall(s *Server, branch string, j *Job) error {
 	if !jail.IsFile(depot) {
 		return fmt.Errorf("DepotDownloader not found at %s - set depotdownloader in the agent's config", depot)
 	}
-	if err := os.MkdirAll(s.Dir(), 0o755); err != nil {
-		return fmt.Errorf("could not create %s", s.Dir())
+	if err := a.readyForFiles(s); err != nil {
+		return err
 	}
 	args := []string{"-app", AppID, "-os", "linux", "-dir", s.Dir(), "-validate"}
 	if branch != "main" {
@@ -51,7 +51,11 @@ func (a *Agent) depotInstall(s *Server, branch string, j *Job) error {
 	j.log("> DepotDownloader " + strings.Join(args, " "))
 
 	cmd := exec.Command(depot, args...)
-	cmd.Dir = filepath.Dir(depot)
+	// Its own folder is root's (the agent can't replace it): it works in the agent's state folder.
+	cmd.Dir = a.Cfg.StateDir + "/depotdownloader"
+	if err := os.MkdirAll(cmd.Dir, 0o700); err != nil {
+		return err
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	pr, pw := io.Pipe()
 	cmd.Stdout, cmd.Stderr = pw, pw
@@ -120,6 +124,40 @@ wait:
 	return nil
 }
 
+// readyForFiles: game files are only installed into a stopped server (no game code running that could race the
+// writes) whose folder holds no links - DepotDownloader writes by path, so a link left by a plugin could otherwise
+// lead its writes into another server or the agent's own files.
+func (a *Agent) readyForFiles(s *Server) error {
+	if a.sup.MainPID(s.Slug) > 0 {
+		return errors.New("the server is running - stop it first")
+	}
+	if err := s.ensureDir(); err != nil {
+		return err
+	}
+	j, err := jail.Open(s.Dir())
+	if err != nil {
+		return err
+	}
+	defer j.Close()
+	var links []string
+	_ = fs.WalkDir(j.FS(), ".", func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if p == gameDir+"/home" {
+			return fs.SkipDir // Steam's own links for the game's HOME
+		}
+		if d.Type()&fs.ModeSymlink != 0 && len(links) < 10 {
+			links = append(links, p)
+		}
+		return nil
+	})
+	if len(links) > 0 {
+		return fmt.Errorf("the server folder contains links (%s) - remove them in the File Manager first", strings.Join(links, ", "))
+	}
+	return nil
+}
+
 // scanLinesCR splits on \n and on a lone \r (progress lines overwrite each other with \r).
 func scanLinesCR(data []byte, atEOF bool) (int, []byte, error) {
 	for i, c := range data {
@@ -154,10 +192,14 @@ func assertTrustedURL(raw string) error {
 func (s *Server) manifestPath() string { return s.LogDir() + "/mod-manifest.json" }
 
 // modInstall downloads a framework and unpacks it over the server folder.
-func (a *Agent) modInstall(s *Server, framework string, j *Job) ([]string, error) {
+func (a *Agent) modInstall(s *Server, framework string, job *Job) ([]string, error) {
 	if !frameworks[framework] {
 		return nil, errors.New("unknown mod framework")
 	}
+	if err := a.readyForFiles(s); err != nil {
+		return nil, err
+	}
+	j := job
 	link := a.Cfg.Mods[framework]
 	if err := assertTrustedURL(link); err != nil {
 		return nil, err
@@ -199,13 +241,18 @@ func (a *Agent) modInstall(s *Server, framework string, j *Job) ([]string, error
 	// Logged so a changed download is visible in the task history.
 	j.logf("Downloaded %.1f MB, SHA-256 %s", float64(size)/1048576, hex.EncodeToString(hash.Sum(nil)))
 	j.log("Extracting into " + s.Dir())
-	files, err := extractArchive(tmp, s.Dir(), MaxModBytes, MaxModEntries)
+	sj, err := jail.Open(s.Dir())
+	if err != nil {
+		return nil, err
+	}
+	defer sj.Close()
+	files, err := extractArchive(tmp, sj, MaxModBytes, MaxModEntries)
 	if err != nil {
 		return nil, err
 	}
 	j.logf("%d files extracted.", len(files))
 	raw, _ := json.MarshalIndent(map[string]any{"framework": framework, "files": files}, "", "    ")
-	_ = os.WriteFile(s.manifestPath(), raw, 0o640)
+	_ = os.WriteFile(s.manifestPath(), raw, 0o600)
 	return files, nil
 }
 
@@ -213,7 +260,15 @@ var carbonUserData = regexp.MustCompile(`(?i)^carbon/(plugins|configs|data|lang|
 
 // modRemove: Carbon's loader files go (user data is kept); Oxide replaced game files, so the game is validated.
 func (a *Agent) modRemove(s *Server, framework, branch string, j *Job) error {
+	if a.sup.MainPID(s.Slug) > 0 {
+		return errors.New("the server is running - stop it first")
+	}
 	if framework == "carbon" {
+		sj, err := jail.Open(s.Dir())
+		if err != nil {
+			return err
+		}
+		defer sj.Close()
 		var manifest struct {
 			Framework string   `json:"framework"`
 			Files     []string `json:"files"`
@@ -234,8 +289,7 @@ func (a *Agent) modRemove(s *Server, framework, branch string, j *Job) error {
 				continue
 			}
 			seen[rel] = true
-			path := s.Dir() + "/" + rel
-			if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() && os.Remove(path) == nil {
+			if sj.IsFile(rel) && sj.Remove(rel) == nil {
 				removed++
 			}
 		}
@@ -289,8 +343,8 @@ func normaliseEntry(name string) (string, error) {
 	return strings.Join(parts, "/"), nil
 }
 
-// extractArchive unpacks a .zip or .tar.gz into dest; everything is checked before anything is written.
-func extractArchive(archive, dest string, maxBytes int64, maxEntries int) ([]string, error) {
+// extractArchive unpacks a .zip or .tar.gz into the jail; everything is checked before anything is written.
+func extractArchive(archive string, j *jail.Jail, maxBytes int64, maxEntries int) ([]string, error) {
 	f, err := os.Open(archive)
 	if err != nil {
 		return nil, err
@@ -300,42 +354,37 @@ func extractArchive(archive, dest string, maxBytes int64, maxEntries int) ([]str
 	f.Close()
 	switch {
 	case string(magic) == "PK\x03\x04":
-		return extractZip(archive, dest, nil, maxBytes, maxEntries)
+		return extractZip(archive, j, "", nil, maxBytes, maxEntries)
 	case magic[0] == 0x1f && magic[1] == 0x8b:
-		return extractTarGz(archive, dest, maxBytes, maxEntries)
+		return extractTarGz(archive, j, maxBytes, maxEntries)
 	}
 	return nil, errors.New("unsupported archive format (expected .zip or .tar.gz)")
 }
 
-// writeInside writes one file under root, refusing to write through a link that leads out of it.
-func writeInside(root, rel string, src io.Reader, mode os.FileMode) error {
-	target := root + "/" + rel
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+// writeEntry writes one file into the jail: a new temporary file + rename (a link or hardlink at the target is
+// replaced, never written through), mode set on the open file.
+func writeEntry(j *jail.Jail, rel string, src io.Reader, limit int64, executable bool) error {
+	if _, err := j.MkdirAll(parentOf(rel)); err != nil {
 		return err
 	}
-	parent, err := filepath.EvalSymlinks(filepath.Dir(target))
-	realRoot, err2 := filepath.EvalSymlinks(root)
-	if err != nil || err2 != nil || (parent != realRoot && !strings.HasPrefix(parent, realRoot+"/")) {
-		return fmt.Errorf("refusing to write %s outside the destination folder", rel)
+	mode := fs.FileMode(0o660)
+	if executable {
+		mode = 0o770
 	}
-	if jail.IsLink(target) {
-		_ = os.Remove(target) // never write through a link
+	if j.IsDir(rel) {
+		return fmt.Errorf("%s is a folder in the destination", rel)
 	}
-	out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
-	if err != nil {
-		return fmt.Errorf("could not write %s (is the server still running?)", target)
+	if err := j.WriteAtomicFrom(rel, src, limit, mode); err != nil {
+		return fmt.Errorf("could not write %s (is the server still running?)", rel)
 	}
-	_, err = io.Copy(out, src)
-	if cerr := out.Close(); err == nil {
-		err = cerr
-	}
-	return err
+	return nil
 }
 
 func zipIsLink(f *zip.File) bool { return f.Mode()&os.ModeSymlink != 0 }
 
-// extractZip unpacks every file whose name skip doesn't refuse; links refuse the whole archive.
-func extractZip(archive, dest string, skip func(string) bool, maxBytes int64, maxEntries int) ([]string, error) {
+// extractZip unpacks every file whose name skip doesn't refuse into prefix/ inside the jail; links refuse the
+// whole archive.
+func extractZip(archive string, j *jail.Jail, prefix string, skip func(string) bool, maxBytes int64, maxEntries int) ([]string, error) {
 	zr, err := zip.OpenReader(archive)
 	if err != nil {
 		return nil, errors.New("not a valid zip archive")
@@ -358,6 +407,9 @@ func extractZip(archive, dest string, skip func(string) bool, maxBytes int64, ma
 		if zipIsLink(f) {
 			return nil, fmt.Errorf("archive contains a link: %s", rel)
 		}
+		if _, err := jail.Normalise(rel); err != nil {
+			return nil, fmt.Errorf("unsafe name in archive: %s", rel)
+		}
 		entries = append(entries, entry{f, rel})
 		total += int64(f.UncompressedSize64)
 	}
@@ -367,37 +419,27 @@ func extractZip(archive, dest string, skip func(string) bool, maxBytes int64, ma
 	if total > maxBytes {
 		return nil, fmt.Errorf("archive unpacks to %.0f MB - more than the %d MB allowed", float64(total)/1048576, maxBytes/1048576)
 	}
-	if err := os.MkdirAll(dest, 0o755); err != nil {
-		return nil, err
-	}
 	written := []string{}
-	var copied int64
+	left := maxBytes
 	for _, e := range entries {
 		rc, err := e.f.Open()
 		if err != nil {
 			return nil, fmt.Errorf("could not read %s from the archive", e.rel)
 		}
-		// The sizes in a zip can lie: never write more than the limit.
-		lr := &io.LimitedReader{R: rc, N: maxBytes - copied + 1}
-		err = writeInside(dest, e.rel, lr, 0o644)
+		// archive/zip refuses entries larger than their header says; the limit is the rest of the allowance.
+		err = writeEntry(j, strings.Trim(prefix+"/"+e.rel, "/"), rc, left, e.f.Mode()&0o111 != 0)
 		rc.Close()
 		if err != nil {
 			return nil, err
 		}
-		copied += (maxBytes - copied + 1) - lr.N
-		if copied > maxBytes {
-			return nil, errors.New("archive unpacks to more than allowed")
-		}
-		if e.f.Mode()&0o111 != 0 {
-			_ = os.Chmod(dest+"/"+e.rel, 0o755)
-		}
+		left -= int64(e.f.UncompressedSize64)
 		written = append(written, e.rel)
 	}
 	return written, nil
 }
 
 // extractTarGz: only plain files and folders (no links, devices...), checked in a first pass.
-func extractTarGz(archive, dest string, maxBytes int64, maxEntries int) ([]string, error) {
+func extractTarGz(archive string, j *jail.Jail, maxBytes int64, maxEntries int) ([]string, error) {
 	open := func() (*tar.Reader, func(), error) {
 		f, err := os.Open(archive)
 		if err != nil {
@@ -429,9 +471,13 @@ func extractTarGz(archive, dest string, maxBytes int64, maxEntries int) ([]strin
 			closeFn()
 			return nil, fmt.Errorf("archive contains a link or special file: %s", h.Name)
 		}
-		if _, err := normaliseEntry(h.Name); err != nil {
+		rel, err := normaliseEntry(h.Name)
+		if err == nil && rel != "" {
+			_, err = jail.Normalise(rel)
+		}
+		if err != nil {
 			closeFn()
-			return nil, err
+			return nil, fmt.Errorf("unsafe name in archive: %s", h.Name)
 		}
 		count++
 		total += h.Size
@@ -448,9 +494,6 @@ func extractTarGz(archive, dest string, maxBytes int64, maxEntries int) ([]strin
 		return nil, err
 	}
 	defer closeFn()
-	if err := os.MkdirAll(dest, 0o755); err != nil {
-		return nil, err
-	}
 	written := []string{}
 	for {
 		h, err := tr.Next()
@@ -461,17 +504,16 @@ func extractTarGz(archive, dest string, maxBytes int64, maxEntries int) ([]strin
 			return nil, errors.New("could not read the archive")
 		}
 		rel, _ := normaliseEntry(h.Name)
-		if rel == "" || h.Typeflag == tar.TypeDir {
-			if rel != "" {
-				_ = os.MkdirAll(dest+"/"+rel, 0o755)
+		if rel == "" {
+			continue
+		}
+		if h.Typeflag == tar.TypeDir {
+			if _, err := j.MkdirAll(rel); err != nil {
+				return nil, err
 			}
 			continue
 		}
-		mode := os.FileMode(0o644)
-		if h.FileInfo().Mode()&0o111 != 0 {
-			mode = 0o755
-		}
-		if err := writeInside(dest, rel, io.LimitReader(tr, h.Size), mode); err != nil {
+		if err := writeEntry(j, rel, io.LimitReader(tr, h.Size), h.Size, h.FileInfo().Mode()&0o111 != 0); err != nil {
 			return nil, err
 		}
 		written = append(written, rel)

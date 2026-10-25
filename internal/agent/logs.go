@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bufio"
 	"crypto/rand"
 	"encoding/hex"
 	"io"
@@ -10,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/Zand3rsCode/rerust-agent/internal/jail"
 )
 
 var rotatedLog = regexp.MustCompile(`^server-\d{8}-\d{6}(-\d+)?\.log$`)
@@ -29,8 +32,9 @@ const (
 )
 
 var (
-	ansi       = regexp.MustCompile(`\x1b\[[\d;]*[A-Za-z]|[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]`)
-	rconSecret = regexp.MustCompile(`(?i)(rcon\.password[\s":=]+)[^\s"]+`)
+	ansi = regexp.MustCompile(`\x1b\[[\d;]*[A-Za-z]|[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]`)
+	// The value after rcon.password: a quoted one as a whole (it may contain spaces), else up to the next space.
+	rconSecret = regexp.MustCompile(`(?i)(rcon\.password["']?[\s:=]+)("[^"]*"|'[^']*'|[^\s"']+)`)
 	lineBreak  = regexp.MustCompile(`\r?\n`)
 )
 
@@ -42,18 +46,39 @@ func maskSecrets(line string) string {
 	return line
 }
 
-// tail is the panel's LogTail::read: complete lines after offset, at most maxBytes (older lines are skipped then).
-// A file that got shorter (a new server session) starts over with reset = true.
+// tail is the panel's LogTail::read for a file the agent owns (job and update logs).
 func tail(path string, offset, maxBytes int64) map[string]any {
-	reply := func(lines []string, off int64, reset bool) map[string]any {
-		if lines == nil {
-			lines = []string{}
-		}
-		return map[string]any{"lines": lines, "offset": off, "reset": reset}
+	f, err := os.Open(path)
+	if err != nil {
+		return tailReply(nil, 0, offset > 0)
 	}
-	info, err := os.Stat(path)
+	defer f.Close()
+	return tailFile(f, offset, maxBytes)
+}
+
+// tailJail reads a log inside a server folder (the game writes those): through the jail, regular files only.
+func tailJail(j *jail.Jail, rel string, offset, maxBytes int64) (map[string]any, int64) {
+	f, info, err := j.OpenRegular(rel, -1)
+	if err != nil {
+		return tailReply(nil, 0, offset > 0), 0
+	}
+	defer f.Close()
+	return tailFile(f, offset, maxBytes), info.Size()
+}
+
+func tailReply(lines []string, off int64, reset bool) map[string]any {
+	if lines == nil {
+		lines = []string{}
+	}
+	return map[string]any{"lines": lines, "offset": off, "reset": reset}
+}
+
+// tailFile: complete lines after offset, at most maxBytes (older lines are skipped then). A file that got shorter
+// (a new server session) starts over with reset = true.
+func tailFile(f *os.File, offset, maxBytes int64) map[string]any {
+	info, err := f.Stat()
 	if err != nil || !info.Mode().IsRegular() {
-		return reply(nil, 0, offset > 0)
+		return tailReply(nil, 0, offset > 0)
 	}
 	size := info.Size()
 	reset := false
@@ -65,22 +90,17 @@ func tail(path string, offset, maxBytes int64) map[string]any {
 		offset, skipPartial = size-maxBytes, true
 	}
 	if offset == size {
-		return reply(nil, offset, reset)
+		return tailReply(nil, offset, reset)
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		return reply(nil, offset, reset)
-	}
-	defer f.Close()
 	chunk := make([]byte, size-offset)
 	n, err := f.ReadAt(chunk, offset)
 	if err != nil && err != io.EOF {
-		return reply(nil, offset, reset)
+		return tailReply(nil, offset, reset)
 	}
 	chunk = chunk[:n]
 	last := strings.LastIndexByte(string(chunk), '\n')
 	if last < 0 {
-		return reply(nil, offset, reset)
+		return tailReply(nil, offset, reset)
 	}
 	complete := string(chunk[:last+1])
 	lines := lineBreak.Split(strings.TrimRight(complete, "\r\n"), -1)
@@ -88,17 +108,21 @@ func tail(path string, offset, maxBytes int64) map[string]any {
 		lines = lines[1:]
 	}
 	for i, l := range lines {
-		l = ansi.ReplaceAllString(l, "")
-		if !utf8.ValidString(l) {
-			l = strings.ToValidUTF8(l, "?")
-		}
-		lines[i] = maskSecrets(l)
+		lines[i] = cleanLine(l)
 	}
-	return reply(lines, offset+int64(len(complete)), reset)
+	return tailReply(lines, offset+int64(len(complete)), reset)
+}
+
+func cleanLine(l string) string {
+	l = ansi.ReplaceAllString(l, "")
+	if !utf8.ValidString(l) {
+		l = strings.ToValidUTF8(l, "?")
+	}
+	return maskSecrets(l)
 }
 
 func fileSize(path string) int64 {
-	if info, err := os.Stat(path); err == nil && info.Mode().IsRegular() {
+	if info, err := os.Lstat(path); err == nil && info.Mode().IsRegular() {
 		return info.Size()
 	}
 	return 0
@@ -106,11 +130,11 @@ func fileSize(path string) int64 {
 
 func (a *Agent) logRead(w http.ResponseWriter, r *http.Request, s *Server) {
 	in, _ := readInput(r)
-	path := s.LogPath()
+	rel := serverLog
 	switch in.str("file") {
 	case "", "server":
 	case "output":
-		path = s.OutputPath()
+		rel = outputLog
 	default:
 		invalid(w, "file must be server or output.")
 		return
@@ -129,13 +153,27 @@ func (a *Agent) logRead(w http.ResponseWriter, r *http.Request, s *Server) {
 		invalid(w, "offset must be 0 or more.")
 		return
 	}
-	reply := tail(path, offset, maxBytes)
-	reply["size"] = fileSize(path)
+	j, err := jail.Open(s.Dir())
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"lines": []string{}, "offset": 0, "reset": offset > 0, "size": 0})
+		return
+	}
+	defer j.Close()
+	reply, size := tailJail(j, rel, offset, maxBytes)
+	reply["size"] = size
 	writeJSON(w, 200, reply)
 }
 
+// logDownload streams server.log line by line with secrets masked (Rust logs its command line with the RCON
+// password).
 func (a *Agent) logDownload(w http.ResponseWriter, r *http.Request, s *Server) {
-	f, err := os.Open(s.LogPath())
+	j, err := jail.Open(s.Dir())
+	if err != nil {
+		fail(w, 404, "not_found", "There is no server log yet.")
+		return
+	}
+	defer j.Close()
+	f, _, err := j.OpenRegular(serverLog, -1)
 	if err != nil {
 		fail(w, 404, "not_found", "There is no server log yet.")
 		return
@@ -143,5 +181,11 @@ func (a *Agent) logDownload(w http.ResponseWriter, r *http.Request, s *Server) {
 	defer f.Close()
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Content-Disposition", `attachment; filename="`+s.Slug+`-server.log"`)
-	_, _ = io.Copy(w, f)
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 64*1024), 4*1024*1024)
+	bw := bufio.NewWriter(w)
+	for sc.Scan() {
+		_, _ = bw.WriteString(maskSecrets(sc.Text()) + "\n")
+	}
+	_ = bw.Flush()
 }

@@ -8,8 +8,7 @@ import (
 	"io"
 	"mime"
 	"net/http"
-	"os"
-	"path/filepath"
+	"path"
 	"regexp"
 	"sort"
 	"strings"
@@ -43,25 +42,16 @@ func jailFail(w http.ResponseWriter, err error, code string) {
 
 func sha1Hex(b []byte) string { s := sha1.Sum(b); return hex.EncodeToString(s[:]) }
 
-// atomicWrite writes through a temporary file + rename; falls back to writing in place when the target can't be
-// replaced but is still writable.
-func atomicWrite(path string, content []byte) error {
-	dir := filepath.Dir(path)
-	tmp := dir + "/.rerust-" + randomHex(6) + ".tmp"
-	mode := os.FileMode(0o644)
-	if info, err := os.Stat(path); err == nil {
-		mode = info.Mode().Perm()
+func bad(msg string) error { return &jail.Error{Status: 422, Message: msg} }
+
+// openJail opens the server folder or answers the error.
+func openJail(w http.ResponseWriter, s *Server, code string) (*jail.Jail, bool) {
+	j, err := jail.Open(s.Dir())
+	if err != nil {
+		jailFail(w, err, code)
+		return nil, false
 	}
-	if err := os.WriteFile(tmp, content, mode); err == nil {
-		if os.Rename(tmp, path) == nil {
-			return nil
-		}
-	}
-	_ = os.Remove(tmp)
-	if err := os.WriteFile(path, content, mode); err != nil {
-		return &jail.Error{Status: 422, Message: "Could not save the file. It may be locked by the server."}
-	}
-	return nil
+	return j, true
 }
 
 /* ---------- /files: the panel's own files (server.cfg, plugin data) ---------- */
@@ -71,8 +61,8 @@ func (a *Agent) fileWrite(w http.ResponseWriter, r *http.Request, s *Server) {
 	if !ok {
 		return
 	}
-	path := in.str("path")
-	if path == "" || len(path) > 1024 || !in.has("content") {
+	p := in.str("path")
+	if p == "" || len(p) > 1024 || !in.has("content") {
 		invalid(w, "path and content are required.")
 		return
 	}
@@ -82,42 +72,30 @@ func (a *Agent) fileWrite(w http.ResponseWriter, r *http.Request, s *Server) {
 		return
 	}
 	// Writing creates the server's own folder when missing (never through a link).
-	if !jail.IsDir(s.Dir()) && !jail.IsLink(s.Dir()) {
-		_ = os.MkdirAll(s.Dir(), 0o755)
-	}
-	j, err := jail.New(s.Dir())
-	if err != nil {
-		jailFail(w, err, "")
+	if err := s.ensureDir(); err != nil {
+		fail(w, 422, "file_error", err.Error())
 		return
 	}
-	rel, err := j.Normalise(path)
+	j, ok := openJail(w, s, "")
+	if !ok {
+		return
+	}
+	defer j.Close()
+	rel, err := jail.Normalise(p)
 	if err == nil && rel == "" {
-		err = &jail.Error{Status: 422, Message: "A file name is required."}
+		err = bad("A file name is required.")
 	}
 	if err != nil {
 		jailFail(w, err, "")
-		return
-	}
-	parent := ""
-	if i := strings.LastIndex(rel, "/"); i >= 0 {
-		parent = rel[:i]
-	}
-	if _, err := j.MkdirAll(parent); err != nil {
-		jailFail(w, err, "")
-		return
-	}
-	full := j.Root() + "/" + rel
-	if jail.IsLink(full) || jail.IsDir(full) {
-		fail(w, 403, "file_error", "Cannot write there.")
 		return
 	}
 	if in.truthy("if_changed") {
-		if old, err := os.ReadFile(full); err == nil && bytes.Equal(old, content) {
+		if old, _, err := j.ReadRegular(rel, int64(len(content))); err == nil && bytes.Equal(old, content) {
 			writeJSON(w, 200, map[string]any{"written": false, "size": len(content)})
 			return
 		}
 	}
-	if err := atomicWrite(full, content); err != nil {
+	if err := j.WriteAtomic(rel, content, 0o660); err != nil {
 		jailFail(w, err, "")
 		return
 	}
@@ -126,33 +104,19 @@ func (a *Agent) fileWrite(w http.ResponseWriter, r *http.Request, s *Server) {
 
 func (a *Agent) fileRead(w http.ResponseWriter, r *http.Request, s *Server) {
 	in, _ := readInput(r)
-	path := in.str("path")
-	if path == "" || len(path) > 1024 {
+	p := in.str("path")
+	if p == "" || len(p) > 1024 {
 		invalid(w, "The path field is required.")
 		return
 	}
-	j, err := jail.New(s.Dir())
+	j, ok := openJail(w, s, "")
+	if !ok {
+		return
+	}
+	defer j.Close()
+	content, info, err := j.ReadRegular(p, MaxRead)
 	if err != nil {
 		jailFail(w, err, "")
-		return
-	}
-	full, err := j.Existing(path, true)
-	if err != nil {
-		jailFail(w, err, "")
-		return
-	}
-	info, err := os.Stat(full)
-	if err != nil || !info.Mode().IsRegular() {
-		fail(w, 422, "file_error", "Not a file.")
-		return
-	}
-	if info.Size() > MaxRead {
-		fail(w, 413, "file_error", "The file is too large to read this way.")
-		return
-	}
-	content, err := os.ReadFile(full)
-	if err != nil {
-		fail(w, 422, "file_error", "Could not read the file.")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"content": base64.StdEncoding.EncodeToString(content), "size": info.Size()})
@@ -161,12 +125,13 @@ func (a *Agent) fileRead(w http.ResponseWriter, r *http.Request, s *Server) {
 func (a *Agent) fileStat(w http.ResponseWriter, r *http.Request, s *Server) {
 	in, _ := readInput(r)
 	missing := map[string]any{"exists": false, "dir": false, "size": 0, "mtime": 0, "sha1": nil}
-	j, err := jail.New(s.Dir())
+	j, err := jail.Open(s.Dir())
 	if err != nil {
 		writeJSON(w, 200, missing)
 		return
 	}
-	full, err := j.Existing(in.str("path"), true)
+	defer j.Close()
+	_, info, err := j.Existing(in.str("path"), true)
 	if err != nil {
 		if jail.Status(err) == 404 {
 			writeJSON(w, 200, missing)
@@ -175,14 +140,11 @@ func (a *Agent) fileStat(w http.ResponseWriter, r *http.Request, s *Server) {
 		jailFail(w, err, "")
 		return
 	}
-	info, _ := os.Stat(full)
 	reply := map[string]any{"exists": true, "dir": info.IsDir(), "size": 0, "mtime": info.ModTime().Unix(), "sha1": nil}
 	if info.Mode().IsRegular() {
 		reply["size"] = info.Size()
-		if info.Size() <= MaxRead {
-			if raw, err := os.ReadFile(full); err == nil {
-				reply["sha1"] = sha1Hex(raw)
-			}
+		if raw, _, err := j.ReadRegular(in.str("path"), MaxRead); err == nil {
+			reply["sha1"] = sha1Hex(raw)
 		}
 	}
 	writeJSON(w, 200, reply)
@@ -190,17 +152,18 @@ func (a *Agent) fileStat(w http.ResponseWriter, r *http.Request, s *Server) {
 
 func (a *Agent) fileDelete(w http.ResponseWriter, r *http.Request, s *Server) {
 	in, _ := readInput(r)
-	path := in.str("path")
-	if path == "" {
+	p := in.str("path")
+	if p == "" {
 		invalid(w, "The path field is required.")
 		return
 	}
-	j, err := jail.New(s.Dir())
+	j, err := jail.Open(s.Dir())
 	if err != nil {
 		writeJSON(w, 200, map[string]any{"deleted": false})
 		return
 	}
-	full, err := j.Existing(path, false)
+	defer j.Close()
+	rel, info, err := j.Existing(p, false)
 	if err != nil {
 		if jail.Status(err) == 404 {
 			writeJSON(w, 200, map[string]any{"deleted": false})
@@ -209,11 +172,11 @@ func (a *Agent) fileDelete(w http.ResponseWriter, r *http.Request, s *Server) {
 		jailFail(w, err, "")
 		return
 	}
-	if jail.IsLink(full) || !jail.IsFile(full) {
+	if !info.Mode().IsRegular() {
 		fail(w, 403, "file_error", "Only files can be deleted this way.")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"deleted": os.Remove(full) == nil})
+	writeJSON(w, 200, map[string]any{"deleted": j.Remove(rel) == nil})
 }
 
 /* ---------- /fm: File Manager + Plugins page ---------- */
@@ -282,6 +245,7 @@ func splitDigits(s string) (string, string) {
 var (
 	infoPattern = regexp.MustCompile(`\[\s*Info\s*\(\s*"((?:[^"\\]|\\.)*)"\s*,\s*"((?:[^"\\]|\\.)*)"\s*,\s*(?:"((?:[^"\\]|\\.)*)"|([\d.]+))`)
 	descPattern = regexp.MustCompile(`\[\s*Description\s*\(\s*"((?:[^"\\]|\\.)*)"`)
+	disabledDir = regexp.MustCompile(`^[a-z-]{1,32}$`)
 )
 
 // infoHead is only the [Info(...)] and [Description(...)] parts of a plugin's source (the panel parses them).
@@ -300,11 +264,11 @@ func (a *Agent) fmOp(w http.ResponseWriter, r *http.Request, s *Server) {
 	if !ok {
 		return
 	}
-	j, err := jail.New(s.Dir())
-	if err != nil {
-		jailFail(w, err, "file_error")
+	j, ok := openJail(w, s, "file_error")
+	if !ok {
 		return
 	}
+	defer j.Close()
 	reply, err := fmDo(j, in)
 	if err != nil {
 		jailFail(w, err, "file_error")
@@ -313,11 +277,9 @@ func (a *Agent) fmOp(w http.ResponseWriter, r *http.Request, s *Server) {
 	writeJSON(w, 200, reply)
 }
 
-func bad(msg string) error { return &jail.Error{Status: 422, Message: msg} }
-
 func fmDo(j *jail.Jail, in input) (any, error) {
-	path := in.str("path")
-	if len(path) > 1024 {
+	p := in.str("path")
+	if len(p) > 1024 {
 		return nil, bad("The path is too long.")
 	}
 	name := in.str("name")
@@ -329,11 +291,11 @@ func fmDo(j *jail.Jail, in input) (any, error) {
 	}
 	switch in.str("op") {
 	case "list":
-		return fmList(j, path)
+		return fmList(j, p)
 	case "read":
-		return fmRead(j, path)
+		return fmRead(j, p)
 	case "write":
-		if path == "" || !in.has("content") {
+		if p == "" || !in.has("content") {
 			return nil, bad("path and content are required.")
 		}
 		var hash *string
@@ -343,52 +305,54 @@ func fmDo(j *jail.Jail, in input) (any, error) {
 			}
 			hash = &h
 		}
-		h, err := fmWrite(j, path, in.str("content"), hash)
+		h, err := fmWrite(j, p, in.str("content"), hash)
 		return map[string]any{"hash": h}, err
 	case "create_file":
 		if err := needName(); err != nil {
 			return nil, err
 		}
-		abs, rel, err := j.NewPath(path, name)
+		rel, err := j.NewPath(p, name)
 		if err != nil {
 			return nil, err
 		}
-		if err := os.WriteFile(abs, nil, 0o644); err != nil {
+		f, err := j.Create(rel, 0o660)
+		if err != nil {
 			return nil, bad("Could not create the file.")
 		}
+		f.Close()
 		return map[string]any{"path": rel}, nil
 	case "create_folder":
 		if err := needName(); err != nil {
 			return nil, err
 		}
-		abs, rel, err := j.NewPath(path, name)
+		rel, err := j.NewPath(p, name)
 		if err != nil {
 			return nil, err
 		}
-		if err := os.Mkdir(abs, 0o755); err != nil {
+		if err := j.Mkdir(rel); err != nil {
 			return nil, bad("Could not create the folder.")
 		}
 		return map[string]any{"path": rel}, nil
 	case "rename":
-		if path == "" {
+		if p == "" {
 			return nil, bad("The path field is required.")
 		}
 		if err := needName(); err != nil {
 			return nil, err
 		}
-		rel, err := fmRename(j, path, name)
+		rel, err := fmRename(j, p, name)
 		return map[string]any{"path": rel}, err
 	case "delete":
-		if path == "" {
+		if p == "" {
 			return nil, bad("The path field is required.")
 		}
-		return map[string]any{"ok": true}, fmDelete(j, path)
+		return map[string]any{"ok": true}, fmDelete(j, p)
 	case "is_file":
-		return map[string]any{"file": isFileIn(j, path)}, nil
+		return map[string]any{"file": isFileIn(j, p)}, nil
 	case "is_dir":
-		return map[string]any{"dir": isDirIn(j, path)}, nil
+		return map[string]any{"dir": isDirIn(j, p)}, nil
 	case "mkdir":
-		rel, err := j.MkdirAll(path)
+		rel, err := j.MkdirAll(p)
 		return map[string]any{"path": rel}, err
 	case "dirs":
 		paths, ok := in.strings("paths")
@@ -396,9 +360,9 @@ func fmDo(j *jail.Jail, in input) (any, error) {
 			return nil, bad("paths (1 - 50) are required.")
 		}
 		dirs := []string{}
-		for _, p := range paths {
-			if isDirIn(j, p) {
-				dirs = append(dirs, p)
+		for _, d := range paths {
+			if isDirIn(j, d) {
+				dirs = append(dirs, d)
 			}
 		}
 		return map[string]any{"dirs": dirs}, nil
@@ -411,7 +375,7 @@ func fmDo(j *jail.Jail, in input) (any, error) {
 		return map[string]any{"path": rel}, err
 	case "plugins":
 		fw, cfgDir, disabled := in.str("framework"), in.str("config_dir"), in.str("disabled_dir")
-		if (fw != "oxide" && fw != "carbon") || (cfgDir != "config" && cfgDir != "configs") || !regexp.MustCompile(`^[a-z-]{1,32}$`).MatchString(disabled) {
+		if (fw != "oxide" && fw != "carbon") || (cfgDir != "config" && cfgDir != "configs") || !disabledDir.MatchString(disabled) {
 			return nil, bad("framework, config_dir and disabled_dir are required.")
 		}
 		return map[string]any{"plugins": fmPlugins(j, fw, cfgDir, disabled)}, nil
@@ -419,19 +383,18 @@ func fmDo(j *jail.Jail, in input) (any, error) {
 	return nil, &jail.Error{Status: 400, Message: "Unknown file operation."}
 }
 
-func fmList(j *jail.Jail, path string) (any, error) {
-	rel, err := j.Normalise(path)
+func fmList(j *jail.Jail, p string) (any, error) {
+	rel, info, err := j.Existing(p, true)
 	if err != nil {
 		return nil, err
 	}
-	dir, err := j.Existing(rel, true)
-	if err != nil {
-		return nil, err
-	}
-	if !jail.IsDir(dir) {
+	if !info.IsDir() {
 		return nil, bad("Not a folder.")
 	}
-	items, _ := os.ReadDir(dir)
+	items, err := j.ReadDir(rel)
+	if err != nil {
+		return nil, err
+	}
 	entries := []map[string]any{}
 	truncated := false
 	for _, item := range items {
@@ -439,10 +402,9 @@ func fmList(j *jail.Jail, path string) (any, error) {
 			truncated = true
 			break
 		}
-		name := item.Name()
-		full := dir + "/" + name
-		info, _ := os.Lstat(full)
-		isLink := info != nil && info.Mode()&os.ModeSymlink != 0
+		itemRel := strings.Trim(rel+"/"+item.Name(), "/")
+		st, _ := j.Lstat(itemRel)
+		isLink := j.IsLink(itemRel)
 		isDir := !isLink && item.IsDir()
 		kind := "file"
 		if isLink {
@@ -451,16 +413,16 @@ func fmList(j *jail.Jail, path string) (any, error) {
 			kind = "dir"
 		}
 		var size, modified any
-		if !isDir && !isLink && info != nil {
-			size = info.Size()
+		if st != nil {
+			if !isDir && !isLink {
+				size = st.Size()
+			}
+			modified = st.ModTime().Unix()
 		}
-		if info != nil {
-			modified = info.ModTime().Unix()
-		}
-		ext := jail.Ext(name)
+		ext := jail.Ext(item.Name())
 		entries = append(entries, map[string]any{
-			"name":     name,
-			"path":     strings.Trim(rel+"/"+name, "/"),
+			"name":     item.Name(),
+			"path":     itemRel,
 			"type":     kind,
 			"size":     size,
 			"modified": modified,
@@ -478,25 +440,20 @@ func fmList(j *jail.Jail, path string) (any, error) {
 	return map[string]any{"path": rel, "entries": entries, "truncated": truncated}, nil
 }
 
-func fmRead(j *jail.Jail, path string) (any, error) {
-	rel, err := j.Normalise(path)
+func fmRead(j *jail.Jail, p string) (any, error) {
+	rel, err := jail.Normalise(p)
 	if err != nil {
 		return nil, err
 	}
-	full, err := j.Existing(rel, true)
-	if err != nil {
-		return nil, err
-	}
-	info, err := os.Stat(full)
-	if err != nil || !info.Mode().IsRegular() || jail.IsLink(full) {
+	if j.IsLink(rel) {
 		return nil, bad("Not a file.")
 	}
-	if info.Size() > MaxEdit {
-		return nil, bad("File is too large to edit in the browser. Download it instead.")
-	}
-	raw, err := os.ReadFile(full)
+	raw, info, err := j.ReadRegular(rel, MaxEdit)
 	if err != nil {
-		return nil, bad("Could not read the file.")
+		if jail.Status(err) == 413 {
+			return nil, bad("File is too large to edit in the browser. Download it instead.")
+		}
+		return nil, err
 	}
 	content := bytes.TrimPrefix(raw, utf8BOM)
 	if bytes.IndexByte(content, 0) >= 0 || !utf8.Valid(content) {
@@ -512,19 +469,18 @@ func fmRead(j *jail.Jail, path string) (any, error) {
 	}, nil
 }
 
-func fmWrite(j *jail.Jail, path, content string, expected *string) (string, error) {
-	rel, err := j.Normalise(path)
+func fmWrite(j *jail.Jail, p, content string, expected *string) (string, error) {
+	rel, err := jail.Normalise(p)
 	if err != nil {
 		return "", err
 	}
-	full, err := j.Existing(rel, true)
-	if err != nil {
-		return "", err
-	}
-	if !jail.IsFile(full) || jail.IsLink(full) {
+	if !j.IsFile(rel) {
+		if _, err := j.Lstat(rel); err != nil {
+			return "", err
+		}
 		return "", bad("Not a file.")
 	}
-	if !jail.Editable[jail.Ext(full)] {
+	if !jail.Editable[jail.Ext(rel)] {
 		return "", bad("This file type cannot be edited.")
 	}
 	if len(content) > MaxEdit {
@@ -533,7 +489,10 @@ func fmWrite(j *jail.Jail, path, content string, expected *string) (string, erro
 	if !utf8.ValidString(content) || strings.IndexByte(content, 0) >= 0 {
 		return "", bad("Content must be UTF-8 text.")
 	}
-	original, _ := os.ReadFile(full)
+	original, _, err := j.ReadRegular(rel, 4*MaxEdit)
+	if err != nil {
+		return "", err
+	}
 	if expected != nil && sha1Hex(original) != strings.ToLower(*expected) {
 		return "", &jail.Error{Status: jail.Conflict, Message: "The file was changed on disk after you opened it."}
 	}
@@ -546,120 +505,113 @@ func fmWrite(j *jail.Jail, path, content string, expected *string) (string, erro
 	if bytes.HasPrefix(original, utf8BOM) {
 		out = append(append([]byte{}, utf8BOM...), out...)
 	}
-	if err := atomicWrite(full, out); err != nil {
+	if err := j.WriteAtomic(rel, out, 0o660); err != nil {
 		return "", err
 	}
 	return sha1Hex(out), nil
 }
 
-func fmRename(j *jail.Jail, path, name string) (string, error) {
-	rel, err := j.Normalise(path)
+func parentOf(rel string) string {
+	if d := path.Dir(rel); d != "." {
+		return d
+	}
+	return ""
+}
+
+func fmRename(j *jail.Jail, p, name string) (string, error) {
+	rel, _, err := j.Existing(p, false)
 	if err != nil {
 		return "", err
 	}
 	if rel == "" {
 		return "", bad("The server folder itself cannot be renamed.")
 	}
-	from, err := j.Existing(rel, false)
+	to, err := j.NewPath(parentOf(rel), name)
 	if err != nil {
 		return "", err
 	}
-	parent := ""
-	if i := strings.LastIndex(rel, "/"); i >= 0 {
-		parent = rel[:i]
-	}
-	to, newRel, err := j.NewPath(parent, name)
-	if err != nil {
-		return "", err
-	}
-	if err := os.Rename(from, to); err != nil {
+	if err := j.Rename(rel, to); err != nil {
 		return "", bad("Rename failed. The file may be in use by the server.")
 	}
-	return newRel, nil
+	return to, nil
 }
 
-func fmDelete(j *jail.Jail, path string) error {
-	rel, err := j.Normalise(path)
+func fmDelete(j *jail.Jail, p string) error {
+	rel, _, err := j.Existing(p, false)
 	if err != nil {
 		return err
 	}
 	if rel == "" {
 		return bad("The server folder itself cannot be deleted.")
 	}
-	full, err := j.Existing(rel, false)
-	if err != nil {
-		return err
-	}
-	if !jail.DeleteTree(full) {
+	if err := j.RemoveAll(rel); err != nil {
 		return bad("Some items could not be deleted. They may be in use by the server.")
 	}
 	return nil
 }
 
-func isFileIn(j *jail.Jail, path string) bool {
-	p, err := j.Existing(path, false)
-	return err == nil && jail.IsFile(p) && !jail.IsLink(p)
+func isFileIn(j *jail.Jail, p string) bool {
+	rel, err := jail.Normalise(p)
+	return err == nil && j.IsFile(rel)
 }
 
-func isDirIn(j *jail.Jail, path string) bool {
-	p, err := j.Existing(path, false)
-	return err == nil && jail.IsDir(p) && !jail.IsLink(p)
+func isDirIn(j *jail.Jail, p string) bool {
+	rel, err := jail.Normalise(p)
+	return err == nil && j.IsDir(rel)
 }
 
 func fmMove(j *jail.Jail, from, toDir string) (string, error) {
-	source, err := j.Existing(from, false)
+	rel, info, err := j.Existing(from, false)
 	if err != nil {
 		return "", err
 	}
-	if !jail.IsFile(source) || jail.IsLink(source) {
+	if !info.Mode().IsRegular() {
 		return "", bad("Not a file.")
 	}
 	if _, err := j.MkdirAll(toDir); err != nil {
 		return "", err
 	}
-	target, rel, err := j.NewPath(toDir, filepath.Base(source))
+	target, err := j.NewPath(toDir, path.Base(rel))
 	if err != nil {
 		return "", err
 	}
-	if err := os.Rename(source, target); err != nil {
+	if err := j.Rename(rel, target); err != nil {
 		return "", bad("Could not move the file. It may be in use - try again.")
 	}
-	return rel, nil
+	return target, nil
 }
 
-func fmPlugins(j *jail.Jail, framework, configDir, disabledDir string) []map[string]any {
-	root := j.Root()
+func fmPlugins(j *jail.Jail, framework, configDir, disabledFolder string) []map[string]any {
 	out := []map[string]any{}
 	for _, folder := range []struct {
 		name     string
 		disabled bool
-	}{{"plugins", false}, {disabledDir, true}} {
-		dir := root + "/" + framework + "/" + folder.name
-		if !jail.IsDir(dir) || jail.IsLink(dir) || jail.IsLink(root+"/"+framework) {
-			continue
+	}{{"plugins", false}, {disabledFolder, true}} {
+		dir := framework + "/" + folder.name
+		if !j.IsDir(framework) || !j.IsDir(dir) {
+			continue // also a link: IsDir doesn't follow
 		}
-		items, _ := os.ReadDir(dir)
+		items, _ := j.ReadDir(dir)
 		for _, item := range items {
-			full := dir + "/" + item.Name()
-			info, err := os.Lstat(full)
-			if err != nil || !info.Mode().IsRegular() || filepath.Ext(item.Name()) != ".cs" {
+			if !item.Type().IsRegular() || path.Ext(item.Name()) != ".cs" {
 				continue
 			}
-			name := strings.TrimSuffix(item.Name(), ".cs")
-			head := make([]byte, PluginHead)
-			n := 0
-			if f, err := os.Open(full); err == nil {
-				n, _ = io.ReadFull(f, head)
-				f.Close()
+			rel := dir + "/" + item.Name()
+			f, info, err := j.OpenRegular(rel, -1)
+			if err != nil {
+				continue
 			}
-			cfg := root + "/" + framework + "/" + configDir + "/" + name + ".json"
+			head := make([]byte, PluginHead)
+			n, _ := io.ReadFull(f, head)
+			f.Close()
+			name := strings.TrimSuffix(item.Name(), ".cs")
 			out = append(out, map[string]any{
 				"name":       name,
 				"disabled":   folder.disabled,
 				"head":       base64.StdEncoding.EncodeToString([]byte(infoHead(string(head[:n])))),
 				"size":       info.Size(),
 				"modified":   info.ModTime().Unix(),
-				"has_config": jail.IsFile(cfg) && !jail.IsLink(cfg),
+				"has_config": j.IsFile(framework + "/" + configDir + "/" + name + ".json"),
 			})
 		}
 	}
@@ -683,30 +635,24 @@ func (a *Agent) fmUpload(w http.ResponseWriter, r *http.Request, s *Server) {
 		invalid(w, "1 - 20 files are required.")
 		return
 	}
-	j, err := jail.New(s.Dir())
-	if err != nil {
-		jailFail(w, err, "file_error")
+	j, ok := openJail(w, s, "file_error")
+	if !ok {
 		return
 	}
+	defer j.Close()
 	truthy := func(k string) bool { v := r.FormValue(k); return v == "1" || v == "true" }
-	path := r.FormValue("path")
+	dir := r.FormValue("path")
+	var err error
 	if truthy("create") {
-		if _, err := j.MkdirAll(path); err != nil {
-			jailFail(w, err, "file_error")
-			return
-		}
+		dir, err = j.MkdirAll(dir)
+	} else {
+		dir, err = jail.Normalise(dir)
 	}
-	rel, err := j.Normalise(path)
 	if err != nil {
 		jailFail(w, err, "file_error")
 		return
 	}
-	dir, err := j.Existing(rel, true)
-	if err != nil {
-		jailFail(w, err, "file_error")
-		return
-	}
-	if !jail.IsDir(dir) || jail.IsLink(dir) {
+	if !j.IsDir(dir) {
 		fail(w, 422, "file_error", "Target is not a folder.")
 		return
 	}
@@ -718,7 +664,7 @@ func (a *Agent) fmUpload(w http.ResponseWriter, r *http.Request, s *Server) {
 	}
 	var plan []planned
 	for i, fh := range files {
-		name := filepath.Base(strings.ReplaceAll(fh.Filename, `\`, "/"))
+		name := path.Base(strings.ReplaceAll(fh.Filename, `\`, "/"))
 		if err := jail.ValidName(name); err != nil {
 			jailFail(w, err, "file_error")
 			return
@@ -727,12 +673,12 @@ func (a *Agent) fmUpload(w http.ResponseWriter, r *http.Request, s *Server) {
 			jailFail(w, err, "file_error")
 			return
 		}
-		target := dir + "/" + name
-		if jail.IsLink(target) || jail.IsDir(target) {
+		target := strings.Trim(dir+"/"+name, "/")
+		if j.IsLink(target) || j.IsDir(target) {
 			fail(w, 422, "file_error", "“"+name+"” is a folder or link and cannot be replaced.")
 			return
 		}
-		if fileExists(target) && !overwrite {
+		if j.IsFile(target) && !overwrite {
 			fail(w, 409, "file_error", "“"+name+"” already exists.")
 			return
 		}
@@ -745,57 +691,43 @@ func (a *Agent) fmUpload(w http.ResponseWriter, r *http.Request, s *Server) {
 			fail(w, 422, "file_error", "Could not read "+p.name+".")
 			return
 		}
-		tmp := dir + "/.rerust-" + randomHex(6) + ".tmp"
-		out, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
-		if err == nil {
-			_, err = io.Copy(out, src)
-			out.Close()
-		}
+		target := strings.Trim(dir+"/"+p.name, "/")
+		err = j.WriteAtomicFrom(target, src, MaxUpload, 0o660)
 		src.Close()
-		if err == nil {
-			err = os.Rename(tmp, dir+"/"+p.name)
-		}
 		if err != nil {
-			_ = os.Remove(tmp)
 			fail(w, 422, "file_error", "Could not store "+p.name+".")
 			return
 		}
-		stored = append(stored, strings.Trim(rel+"/"+p.name, "/"))
+		stored = append(stored, target)
 	}
 	writeJSON(w, 200, map[string]any{"paths": stored})
 }
 
 func (a *Agent) fmDownload(w http.ResponseWriter, r *http.Request, s *Server) {
-	j, err := jail.New(s.Dir())
-	if err != nil {
-		jailFail(w, err, "file_error")
+	j, ok := openJail(w, s, "file_error")
+	if !ok {
 		return
 	}
-	full, err := j.Existing(r.URL.Query().Get("path"), true)
-	if err == nil && !jail.IsFile(full) {
-		err = bad("Only files can be downloaded.")
-	}
+	defer j.Close()
+	f, info, err := j.OpenRegular(r.URL.Query().Get("path"), -1)
 	if err != nil {
+		if jail.Status(err) == 422 {
+			err = bad("Only files can be downloaded.")
+		}
 		jailFail(w, err, "file_error")
-		return
-	}
-	serveFile(w, full, filepath.Base(full), "application/octet-stream")
-}
-
-func serveFile(w http.ResponseWriter, path, name, contentType string) {
-	f, err := os.Open(path)
-	if err != nil {
-		fail(w, 404, "not_found", "The file is missing.")
 		return
 	}
 	defer f.Close()
-	if info, err := f.Stat(); err == nil {
-		w.Header().Set("Content-Length", itoa(info.Size()))
-	}
+	sendFile(w, f, info.Size(), path.Base(r.URL.Query().Get("path")), "application/octet-stream")
+}
+
+// sendFile streams an open file as an attachment (never more than its size when opened).
+func sendFile(w http.ResponseWriter, f io.Reader, size int64, name, contentType string) {
+	w.Header().Set("Content-Length", itoa(size))
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Disposition", mime.FormatMediaType("attachment", map[string]string{"filename": name}))
-	_, _ = io.Copy(w, f)
+	_, _ = io.Copy(w, io.LimitReader(f, size))
 }
 
 /* ---------- maps ---------- */
@@ -804,13 +736,17 @@ var mapName = regexp.MustCompile(`^map_(\d{3,5})_(\d{1,10})\.png$`)
 
 func (a *Agent) maps(w http.ResponseWriter, r *http.Request, s *Server) {
 	out := []map[string]any{}
-	items, _ := os.ReadDir(s.Dir())
-	for _, item := range items {
-		info, err := os.Lstat(s.Dir() + "/" + item.Name())
-		if err != nil || !info.Mode().IsRegular() || !mapName.MatchString(item.Name()) {
-			continue
+	if j, err := jail.Open(s.Dir()); err == nil {
+		items, _ := j.ReadDir("")
+		for _, item := range items {
+			if !item.Type().IsRegular() || !mapName.MatchString(item.Name()) {
+				continue
+			}
+			if info, err := j.Lstat(item.Name()); err == nil {
+				out = append(out, map[string]any{"name": item.Name(), "size": info.Size(), "mtime": info.ModTime().Unix()})
+			}
 		}
-		out = append(out, map[string]any{"name": item.Name(), "size": info.Size(), "mtime": info.ModTime().Unix()})
+		j.Close()
 	}
 	writeJSON(w, 200, map[string]any{"maps": out})
 }

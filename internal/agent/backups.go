@@ -5,9 +5,11 @@ import (
 	"compress/flate"
 	"crypto/sha256"
 	"crypto/subtle"
+	"encoding"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
 	"net/http"
@@ -19,6 +21,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/Zand3rsCode/rerust-agent/internal/config"
 	"github.com/Zand3rsCode/rerust-agent/internal/jail"
 )
 
@@ -47,19 +50,23 @@ func (s *Server) isBackupName(name string) bool {
 /* ---------- make a backup ---------- */
 
 // backup zips the save folder (minus caches), the framework's folders and HarmonyMods into <base>/_backups/<slug>.
+// The server folder is read through the jail (os.Root): a link or a swapped folder can't pull other files in.
 func (a *Agent) backup(s *Server, framework string, log func(string)) (string, int64, error) {
 	target := s.BackupDir()
-	if err := os.MkdirAll(target, 0o750); err != nil {
+	if err := os.MkdirAll(target, 0o700); err != nil {
 		return "", 0, fmt.Errorf("could not create backup folder %s", target)
 	}
-	type source struct{ prefix, dir string }
-	sources := []source{{"server/" + s.SafeIdentity(), s.SaveDir()}}
-	for _, rel := range append(append([]string{}, FrameworkFolders[framework]...), "HarmonyMods") {
-		sources = append(sources, source{rel, s.Dir() + "/" + rel})
+	j, err := jail.Open(s.Dir())
+	if err != nil {
+		return "", 0, err
 	}
+	defer j.Close()
+	sources := []string{"server/" + s.SafeIdentity()}
+	sources = append(sources, FrameworkFolders[framework]...)
+	sources = append(sources, "HarmonyMods")
 	name := s.Slug + "-" + time.Now().Format("20060102-150405") + ".zip"
 	file := target + "/" + name
-	out, err := os.OpenFile(file, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
+	out, err := os.OpenFile(file, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return "", 0, fmt.Errorf("could not create %s", file)
 	}
@@ -67,17 +74,15 @@ func (a *Agent) backup(s *Server, framework string, log func(string)) (string, i
 	zw.RegisterCompressor(zip.Deflate, func(w io.Writer) (io.WriteCloser, error) { return flate.NewWriter(w, 1) }) // fast; saves are large
 	count, skipped, saves := 0, 0, 0
 	var skippedBytes int64
-	walkErr := error(nil)
+	fsys := j.FS()
+	var walkErr error
 	for _, src := range sources {
-		if !jail.IsDir(src.dir) || jail.IsLink(src.dir) {
-			continue
+		if !j.IsDir(src) {
+			continue // missing, or a link: never followed
 		}
-		walkErr = filepath.WalkDir(src.dir, func(path string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
-			if d.Type()&fs.ModeSymlink != 0 || !d.Type().IsRegular() {
-				return nil // links are never followed; folders are walked
+		walkErr = fs.WalkDir(fsys, src, func(p string, d fs.DirEntry, err error) error {
+			if err != nil || !d.Type().IsRegular() {
+				return nil // links and special files are skipped; folders are walked
 			}
 			info, err := d.Info()
 			if err != nil {
@@ -88,20 +93,18 @@ func (a *Agent) backup(s *Server, framework string, log func(string)) (string, i
 				skippedBytes += info.Size()
 				return nil
 			}
-			rel := src.prefix + "/" + strings.TrimPrefix(path, src.dir+"/")
+			f, _, err := j.OpenRegular(p, -1)
+			if err != nil {
+				return nil // vanished or swapped meanwhile
+			}
+			defer f.Close()
 			h, _ := zip.FileInfoHeader(info)
-			h.Name, h.Method = rel, zip.Deflate
+			h.Name, h.Method = p, zip.Deflate
 			w, err := zw.CreateHeader(h)
 			if err != nil {
 				return err
 			}
-			f, err := os.Open(path)
-			if err != nil {
-				return nil // a file that vanished meanwhile
-			}
-			_, err = io.Copy(w, f)
-			f.Close()
-			if err != nil {
+			if _, err := io.Copy(w, f); err != nil {
 				return err
 			}
 			count++
@@ -169,11 +172,18 @@ func (a *Agent) backupDownload(w http.ResponseWriter, r *http.Request, s *Server
 	if !ok {
 		return
 	}
-	if info, err := os.Lstat(path); err != nil || !info.Mode().IsRegular() {
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
 		fail(w, 404, "not_found", "The backup file is missing.")
 		return
 	}
-	serveFile(w, path, filepath.Base(path), "application/zip")
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		fail(w, 404, "not_found", "The backup file is missing.")
+		return
+	}
+	sendFile(w, f, info.Size(), filepath.Base(path), "application/zip")
 }
 
 func (a *Agent) backupDelete(w http.ResponseWriter, r *http.Request, s *Server) {
@@ -204,6 +214,16 @@ func rootOf(rel string) string {
 	if m := serverRoot.FindStringSubmatch(rel); m != nil {
 		return "server/" + m[1]
 	}
+	return codeRootOf(rel)
+}
+
+// isCodeRoot: plugins and HarmonyMods - restoring them runs their code on the next start, so only on request.
+func isCodeRoot(root string) bool {
+	return root == "HarmonyMods" || strings.HasSuffix(root, "/plugins") || strings.HasSuffix(root, "/plugins-disabled")
+}
+
+// codeRootOf is the framework folder (or HarmonyMods) an entry is in.
+func codeRootOf(rel string) string {
 	for _, list := range [][]string{FrameworkFolders["carbon"], FrameworkFolders["oxide"], {"HarmonyMods"}} {
 		for _, root := range list {
 			if strings.HasPrefix(rel, root+"/") {
@@ -321,13 +341,10 @@ func freeBytes(path string) (int64, bool) {
 }
 
 // restore puts a backup back into the (stopped) server: everything is unpacked into a staging folder inside the
-// server folder, then each folder is swapped in whole by rename; on an error the old ones are put back.
-func (a *Agent) restore(s *Server, name string, log func(string)) (any, error) {
-	dir := s.Dir()
-	if !jail.IsDir(dir) || jail.IsLink(dir) {
-		return nil, fmt.Errorf("the server folder %s is missing", dir)
-	}
-	if len(findByExecutable(s.Exe())) > 0 {
+// server folder, then each folder is swapped in whole by rename; on an error the old ones are put back. Plugins and
+// HarmonyMods (code that runs on the next start) only with code = true. All through the jail.
+func (a *Agent) restore(s *Server, name string, code bool, log func(string)) (any, error) {
+	if a.sup.MainPID(s.Slug) > 0 {
 		return nil, errors.New("the server is running - stop it before restoring a backup")
 	}
 	path := s.BackupDir() + "/" + name
@@ -338,13 +355,30 @@ func (a *Agent) restore(s *Server, name string, log func(string)) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	if len(info.Roots) == 0 {
-		return nil, errors.New("the backup holds nothing that can be restored (no save folder, plugins or HarmonyMods)")
+	roots := []string{}
+	leftOut := []string{}
+	for _, root := range info.Roots {
+		if !isCodeRoot(root) || code {
+			roots = append(roots, root)
+		} else {
+			leftOut = append(leftOut, root)
+		}
 	}
-	if free, ok := freeBytes(dir); ok && free < info.Bytes+FreeMargin {
+	if len(roots) == 0 {
+		return nil, errors.New("the backup holds nothing that can be restored without its plugins (ask for plugins and HarmonyMods too)")
+	}
+	j, err := jail.Open(s.Dir())
+	if err != nil {
+		return nil, fmt.Errorf("the server folder %s is missing", s.Dir())
+	}
+	defer j.Close()
+	if free, ok := freeBytes(s.Dir()); ok && free < info.Bytes+FreeMargin {
 		return nil, fmt.Errorf("not enough free disk space: the backup unpacks to %.1f GB", float64(info.Bytes)/(1<<30))
 	}
-	log(fmt.Sprintf("Restoring %s: %d files, %.1f MB (%s).", name, info.Files, float64(info.Bytes)/1048576, strings.Join(info.Roots, ", ")))
+	log(fmt.Sprintf("Restoring %s: %d files, %.1f MB (%s).", name, info.Files, float64(info.Bytes)/1048576, strings.Join(roots, ", ")))
+	if len(leftOut) > 0 {
+		log("Not restored (plugins / HarmonyMods run code - restore them only when asked): " + strings.Join(leftOut, ", "))
+	}
 	if info.SkippedCount > 0 {
 		more := ""
 		if info.SkippedCount > len(info.Skipped) {
@@ -352,44 +386,47 @@ func (a *Agent) restore(s *Server, name string, log func(string)) (any, error) {
 		}
 		log(fmt.Sprintf("Skipped %d file(s) outside the folders a backup restores: %s%s", info.SkippedCount, strings.Join(info.Skipped, ", "), more))
 	}
-
-	olds, _ := filepath.Glob(dir + "/" + stagingPrefix + "*")
-	for _, old := range olds {
-		if jail.IsDir(old) && !jail.IsLink(old) {
-			jail.DeleteTree(old) // left behind by a crash
+	entries, _ := j.ReadDir("")
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), stagingPrefix) {
+			_ = j.RemoveAll(e.Name()) // left behind by a crash
 		}
 	}
-	staging := dir + "/" + stagingPrefix + randomHex(4)
-	defer jail.DeleteTree(staging)
-	if _, err := extractZip(path, staging+"/new", func(rel string) bool { return rootOf(rel) == "" }, RestoreMaxBytes, RestoreMaxEntries); err != nil {
+	staging := stagingPrefix + randomHex(4)
+	defer func() { _ = j.RemoveAll(staging) }()
+	wanted := map[string]bool{}
+	for _, r := range roots {
+		wanted[r] = true
+	}
+	if _, err := extractZip(path, j, staging+"/new", func(rel string) bool { return !wanted[rootOf(rel)] }, RestoreMaxBytes, RestoreMaxEntries); err != nil {
 		return nil, err
 	}
-	restored, err := swapIn(dir, staging, info.Roots, s.SafeIdentity())
+	restored, err := swapIn(j, staging, roots, s.SafeIdentity())
 	if err != nil {
 		return nil, err
 	}
 	log("Restored: " + strings.Join(restored, ", ") + ".")
 	return map[string]any{
-		"restored": restored, "files": info.Files, "bytes": info.Bytes,
+		"restored": restored, "files": info.Files, "bytes": info.Bytes, "left_out": leftOut,
 		"skipped": info.Skipped, "skipped_count": info.SkippedCount, "map": info.Map,
 	}, nil
 }
 
-func refuseLinks(dir, rel string) error {
-	path := dir
+func refuseLinks(j *jail.Jail, rel string) error {
+	cur := ""
 	for _, part := range strings.Split(rel, "/") {
-		path += "/" + part
-		if jail.IsLink(path) {
+		cur = strings.Trim(cur+"/"+part, "/")
+		if j.IsLink(cur) {
 			return fmt.Errorf("%s is a link in the server folder - refused", rel)
 		}
 	}
 	return nil
 }
 
-func swapIn(dir, staging string, roots []string, identity string) ([]string, error) {
+func swapIn(j *jail.Jail, staging string, roots []string, identity string) ([]string, error) {
 	type step struct {
-		current, old, target string
-		hadOld               bool
+		current, old string
+		hadOld       bool
 	}
 	var done []step
 	restored := []string{}
@@ -399,24 +436,25 @@ func swapIn(dir, staging string, roots []string, identity string) ([]string, err
 			if strings.HasPrefix(root, "server/") {
 				target = "server/" + identity
 			}
-			current, old, fresh := dir+"/"+target, staging+"/old/"+target, staging+"/new/"+root
-			if err := refuseLinks(dir, target); err != nil {
+			current, old, fresh := target, staging+"/old/"+target, staging+"/new/"+root
+			if err := refuseLinks(j, target); err != nil {
 				return err
 			}
-			hadOld := fileExists(current)
+			_, lerr := j.Lstat(current)
+			hadOld := lerr == nil
 			if hadOld {
-				if err := os.MkdirAll(filepath.Dir(old), 0o750); err != nil {
+				if _, err := j.MkdirAll(parentOf(old)); err != nil {
 					return err
 				}
-				if os.Rename(current, old) != nil {
+				if j.Rename(current, old) != nil {
 					return fmt.Errorf("could not move %s aside (a file in use?)", target)
 				}
 			}
-			done = append(done, step{current, old, target, hadOld})
-			if err := os.MkdirAll(filepath.Dir(current), 0o755); err != nil {
+			done = append(done, step{current, old, hadOld})
+			if _, err := j.MkdirAll(parentOf(current)); err != nil {
 				return err
 			}
-			if os.Rename(fresh, current) != nil {
+			if j.Rename(fresh, current) != nil {
 				return fmt.Errorf("could not put the restored %s in place", target)
 			}
 			restored = append(restored, target)
@@ -426,11 +464,11 @@ func swapIn(dir, staging string, roots []string, identity string) ([]string, err
 	if err != nil {
 		for i := len(done) - 1; i >= 0; i-- {
 			st := done[i]
-			if fileExists(st.current) && !jail.IsLink(st.current) {
-				jail.DeleteTree(st.current)
+			if _, e := j.Lstat(st.current); e == nil {
+				_ = j.RemoveAll(st.current)
 			}
 			if st.hadOld {
-				_ = os.Rename(st.old, st.current)
+				_ = j.Rename(st.old, st.current)
 			}
 		}
 		return nil, fmt.Errorf("restore failed, nothing was changed: %v", err)
@@ -451,19 +489,42 @@ var uploadID = regexp.MustCompile(`^[a-f0-9]{32}$`)
 
 func (s *Server) partPath(id string) string { return s.BackupDir() + "/.upload-" + id + ".part" }
 
+// The sha256 of what arrived so far is kept next to the part, so finishing never re-reads 50 GB in one request.
+func (s *Server) hashPath(id string) string { return s.BackupDir() + "/.upload-" + id + ".sha" }
+
+func loadHash(path string) (hash.Hash, error) {
+	h := sha256.New()
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return h, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return h, h.(encoding.BinaryUnmarshaler).UnmarshalBinary(raw)
+}
+
+func saveHash(path string, h hash.Hash) error {
+	raw, err := h.(encoding.BinaryMarshaler).MarshalBinary()
+	if err != nil {
+		return err
+	}
+	return config.WriteAtomic(path, raw, 0o600)
+}
+
 func (a *Agent) uploadBegin(w http.ResponseWriter, r *http.Request, s *Server) {
-	if err := os.MkdirAll(s.BackupDir(), 0o750); err != nil {
+	if err := os.MkdirAll(s.BackupDir(), 0o700); err != nil {
 		fail(w, 500, "failed", "Could not create the backup folder "+s.BackupDir()+".")
 		return
 	}
-	parts, _ := filepath.Glob(s.BackupDir() + "/.upload-*.part")
+	parts, _ := filepath.Glob(s.BackupDir() + "/.upload-*")
 	for _, p := range parts {
 		if info, err := os.Lstat(p); err == nil && info.Mode().IsRegular() && time.Since(info.ModTime()) > StaleUpload {
 			_ = os.Remove(p)
 		}
 	}
 	id := randomHex(16)
-	if err := os.WriteFile(s.partPath(id), nil, 0o640); err != nil {
+	if err := os.WriteFile(s.partPath(id), nil, 0o600); err != nil {
 		fail(w, 500, "failed", "Could not start the upload.")
 		return
 	}
@@ -502,13 +563,18 @@ func (a *Agent) uploadChunk(w http.ResponseWriter, r *http.Request, s *Server) {
 		fail(w, 422, "refused", "Not enough free disk space on this machine for the backup.")
 		return
 	}
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o640)
-	if err != nil {
+	id := r.PathValue("id")
+	h, herr := loadHash(s.hashPath(id))
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil || herr != nil {
 		fail(w, 422, "refused", "Could not write the upload.")
 		return
 	}
-	n, err := io.Copy(f, io.LimitReader(r.Body, ChunkBytes+1))
+	n, err := io.Copy(io.MultiWriter(f, h), io.LimitReader(r.Body, ChunkBytes+1))
 	f.Close()
+	if err == nil && n <= ChunkBytes && size+n <= UploadMax {
+		err = saveHash(s.hashPath(id), h)
+	}
 	if err != nil || n > ChunkBytes || size+n > UploadMax {
 		_ = os.Truncate(path, size)
 		msg := "The backup is too large."
@@ -538,22 +604,21 @@ func (a *Agent) uploadFinish(w http.ResponseWriter, r *http.Request, s *Server) 
 		invalid(w, "size and sha256 are required.")
 		return
 	}
+	id := r.PathValue("id")
 	refuse := func(msg string) {
 		_ = os.Remove(path)
+		_ = os.Remove(s.hashPath(id))
 		fail(w, 422, "refused", msg)
 	}
 	if got := fileSize(path); got != size {
 		refuse(fmt.Sprintf("The upload is incomplete (%d of %d bytes).", got, size))
 		return
 	}
-	f, err := os.Open(path)
+	h, err := loadHash(s.hashPath(id))
 	if err != nil {
 		refuse("Could not read the upload.")
 		return
 	}
-	h := sha256.New()
-	_, _ = io.Copy(h, f)
-	f.Close()
 	if subtle.ConstantTimeCompare([]byte(hex.EncodeToString(h.Sum(nil))), []byte(sum)) != 1 {
 		refuse("The upload is damaged (checksum differs).")
 		return
@@ -564,26 +629,28 @@ func (a *Agent) uploadFinish(w http.ResponseWriter, r *http.Request, s *Server) 
 	} else {
 		zr.Close()
 	}
+	// A normal backup name; os.Link fails when the name exists, so a backup made in the same second is never replaced.
 	t := time.Now()
-	var name, target string
-	for {
+	var name string
+	for i := 0; ; i++ {
 		name = s.Slug + "-" + t.Format("20060102-150405") + ".zip"
-		target = s.BackupDir() + "/" + name
-		if !fileExists(target) {
+		if err := os.Link(path, s.BackupDir()+"/"+name); err == nil {
 			break
+		} else if !os.IsExist(err) || i > 120 {
+			fail(w, 500, "failed", "Could not store the backup.")
+			return
 		}
 		t = t.Add(time.Second)
 	}
-	if os.Rename(path, target) != nil {
-		fail(w, 500, "failed", "Could not store the backup.")
-		return
-	}
+	_ = os.Remove(path)
+	_ = os.Remove(s.hashPath(id))
 	writeJSON(w, 200, map[string]any{"name": name, "size": size})
 }
 
 func (a *Agent) uploadCancel(w http.ResponseWriter, r *http.Request, s *Server) {
 	if id := r.PathValue("id"); uploadID.MatchString(id) {
 		_ = os.Remove(s.partPath(id))
+		_ = os.Remove(s.hashPath(id))
 	}
 	writeJSON(w, 200, map[string]any{"cancelled": true})
 }

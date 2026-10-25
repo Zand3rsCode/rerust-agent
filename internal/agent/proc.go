@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,224 +16,164 @@ import (
 	"github.com/Zand3rsCode/rerust-agent/internal/sysstats"
 )
 
-// KeepLogs previous sessions' logs are kept next to server.log; MaxArgs launch arguments at most.
+// KeepLogs previous sessions' logs are kept; MaxArgs launch arguments at most.
 const (
 	KeepLogs = 10
 	MaxArgs  = 200
 )
 
-/* ---------- /proc helpers ---------- */
+// Inside each server folder: what the game writes (logs) and what its launcher reads. The game owns the folder, so
+// nothing here is trusted by the agent - it is read through the jail like every other file there.
+const (
+	gameDir    = ".rerust"
+	launchFile = gameDir + "/launch.json"
+	serverLog  = gameDir + "/server.log"
+	outputLog  = gameDir + "/output.log"
+	oldLogs    = gameDir + "/logs"
+)
 
-// exeOf is /proc/<pid>/exe without " (deleted)"; "" when gone, a zombie or not readable.
-func exeOf(pid int) string {
-	if pid <= 0 {
-		return ""
-	}
-	target, err := os.Readlink(sysstats.Proc + "/" + strconv.Itoa(pid) + "/exe")
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSuffix(target, " (deleted)")
+func procRoot() string { return sysstats.Proc }
+
+// LaunchSpec is what the launcher (rerust-agent launch, inside the server's unit) starts.
+type LaunchSpec struct {
+	Args   []string `json:"args"`
+	Carbon bool     `json:"carbon"`
 }
 
-func cwdOf(pid int) string {
-	target, err := os.Readlink(sysstats.Proc + "/" + strconv.Itoa(pid) + "/cwd")
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSuffix(target, " (deleted)")
-}
-
-// running: alive and not a zombie.
-func running(pid int) bool {
-	raw, err := os.ReadFile(sysstats.Proc + "/" + strconv.Itoa(pid) + "/status")
-	if err != nil {
-		return false
-	}
-	for _, line := range strings.Split(string(raw), "\n") {
-		if v, ok := strings.CutPrefix(line, "State:"); ok {
-			return !strings.HasPrefix(strings.TrimSpace(v), "Z")
-		}
-	}
-	return true
-}
-
-func commandLine(pid int) []string {
-	if pid <= 0 || !running(pid) || exeOf(pid) == "" {
-		return nil
-	}
-	raw, err := os.ReadFile(sysstats.Proc + "/" + strconv.Itoa(pid) + "/cmdline")
-	if err != nil || len(raw) == 0 {
-		return nil
-	}
-	return strings.Split(strings.TrimRight(string(raw), "\x00"), "\x00")
-}
-
-func allPIDs() []int {
-	var out []int
-	entries, _ := os.ReadDir(sysstats.Proc)
-	for _, e := range entries {
-		if pid, err := strconv.Atoi(e.Name()); err == nil && e.IsDir() {
-			out = append(out, pid)
-		}
-	}
-	sort.Ints(out)
-	return out
-}
-
-func realOr(path string) string {
-	if real, err := filepath.EvalSymlinks(path); err == nil {
-		return real
-	}
-	return path
-}
-
-// findByExecutable is every running process of this exact binary.
-func findByExecutable(path string) []int {
-	want := realOr(path)
-	out := []int{}
-	for _, pid := range allPIDs() {
-		if exeOf(pid) == want && running(pid) {
-			out = append(out, pid)
-		}
-	}
-	return out
-}
-
-// rustInfo is {pid, memory_kb} when pid is a live RustDedicated (comm is cut to 15 characters by the kernel).
-func rustInfo(pid int) map[string]any {
-	raw, err := os.ReadFile(sysstats.Proc + "/" + strconv.Itoa(pid) + "/comm")
-	if err != nil || strings.TrimSpace(string(raw)) != Executable[:min(len(Executable), 15)] || !running(pid) {
-		return nil
-	}
-	kb := sysstats.RSSBytes(pid) / 1024
-	if kb < 0 {
-		kb = 0
-	}
-	return map[string]any{"pid": pid, "memory_kb": kb}
-}
-
-// owns: pid runs this server's own RustDedicated (started from its folder) - PIDs are reused.
-func (s *Server) owns(pid int) bool {
-	exe := exeOf(pid)
-	return exe != "" && (exe == s.Exe() || exe == realOr(s.Exe()))
-}
-
-// killGroup signals the process group when pid leads one (everything the agent starts runs under setsid), else
-// only pid.
-func killGroup(pid int, sig syscall.Signal) {
-	if pid <= 1 {
-		return
-	}
-	if pgid, err := syscall.Getpgid(pid); err == nil && pgid == pid {
-		_ = syscall.Kill(-pid, sig)
-		return
-	}
-	_ = syscall.Kill(pid, sig)
-}
-
-/* ---------- start ---------- */
-
-// environment: the game's native plugin folder on the library path (as Facepunch's runds.sh), and Carbon through
-// Unity Doorstop (LD_PRELOAD on the binary only - there is no shell in between, so Doorstop's dup2 hook can't break
-// the output redirection as it did with the PHP agent's bash launcher).
-func (s *Server) environment(carbon bool) []string {
-	dir := s.Dir()
-	var env []string
-	for _, kv := range os.Environ() {
-		if !strings.HasPrefix(kv, "LD_PRELOAD=") && !strings.HasPrefix(kv, "LD_LIBRARY_PATH=") && !strings.HasPrefix(kv, "DOORSTOP_") {
-			env = append(env, kv)
-		}
-	}
-	env = append(env, "LD_LIBRARY_PATH="+dir+":"+dir+"/RustDedicated_Data/Plugins/x86_64", "TERM=xterm")
-	if carbon && jail.IsFile(dir+"/libdoorstop.so") {
-		env = append(env, "DOORSTOP_ENABLED=1", "DOORSTOP_TARGET_ASSEMBLY="+dir+"/carbon/managed/Carbon.Preloader.dll", "LD_PRELOAD="+dir+"/libdoorstop.so")
-	}
-	return env
-}
-
-// rotateLog: Rust overwrites server.log on every start; the previous one becomes server-YYYYmmdd-HHMMSS.log (its
-// last write time) and only the newest KeepLogs stay.
-func (s *Server) rotateLog() {
-	log := s.LogPath()
-	if info, err := os.Stat(log); err == nil && info.Mode().IsRegular() && info.Size() > 0 {
-		base := s.LogDir() + "/server-" + info.ModTime().Format("20060102-150405")
-		target := base + ".log"
-		for n := 2; fileExists(target) && n < 100; n++ {
-			target = fmt.Sprintf("%s-%d.log", base, n)
-		}
-		_ = os.Rename(log, target)
-	}
-	old, _ := filepath.Glob(s.LogDir() + "/server-*.log")
-	sort.Sort(sort.Reverse(sort.StringSlice(old)))
-	for i, f := range old {
-		if i >= KeepLogs && rotatedLog.MatchString(filepath.Base(f)) {
-			_ = os.Remove(f)
-		}
-	}
-}
-
-func fileExists(path string) bool { _, err := os.Lstat(path); return err == nil }
-
-// start launches RustDedicated detached (own session) and returns its PID.
-func (a *Agent) start(s *Server, args []string, carbon bool) (int, error) {
-	if !s.Installed() {
-		return 0, fmt.Errorf("%s not found in %s. Install the server first", Executable, s.Dir())
-	}
+func validArgs(args []string) error {
 	if len(args) > MaxArgs {
-		return 0, errors.New("too many arguments")
+		return errors.New("too many arguments")
 	}
 	for _, arg := range args {
 		if len(arg) > 2048 || strings.ContainsAny(arg, "\x00\r\n") || strings.EqualFold(arg, "-logfile") {
-			return 0, errors.New("invalid launch argument")
+			return errors.New("invalid launch argument")
 		}
 	}
-	if info, err := os.Stat(s.Exe()); err != nil || info.Mode()&0o111 == 0 {
-		return 0, fmt.Errorf("%s is not executable (chmod +x)", s.Exe())
-	}
-	s.rotateLog()
+	return nil
+}
 
-	// What the process prints (Carbon's preloader writes only to stdout): readable by the agent only - it holds the
-	// command line with the RCON password.
-	out, err := os.OpenFile(s.OutputPath(), os.O_CREATE|os.O_WRONLY|os.O_TRUNC|os.O_APPEND, 0o600)
+// Launch runs inside rerust-server@<slug>.service as the game user, in the server's sandbox (it sees only its own
+// folder): read launch.json, send output to .rerust/output.log, set Rust's library path (and Carbon's Doorstop),
+// then become RustDedicated (exec - the unit's main process is the game itself).
+func Launch(dir string) error {
+	raw, err := os.ReadFile(dir + "/" + launchFile)
 	if err != nil {
-		return 0, fmt.Errorf("could not create %s", s.OutputPath())
+		return fmt.Errorf("no launch file: %v", err)
 	}
-	defer out.Close()
-	_ = os.Chmod(s.OutputPath(), 0o600)
+	var spec LaunchSpec
+	if err := json.Unmarshal(raw, &spec); err != nil {
+		return fmt.Errorf("launch file: %v", err)
+	}
+	if err := validArgs(spec.Args); err != nil {
+		return err
+	}
+	exe := dir + "/" + Executable
+	if err := os.MkdirAll(dir+"/"+gameDir+"/home", 0o770); err != nil {
+		return err
+	}
+	out, err := os.OpenFile(dir+"/"+outputLog, os.O_CREATE|os.O_WRONLY|os.O_TRUNC|syscall.O_NOFOLLOW, 0o640)
+	if err != nil {
+		return fmt.Errorf("output log: %v", err)
+	}
+	if err := syscall.Dup3(int(out.Fd()), 1, 0); err != nil {
+		return err
+	}
+	if err := syscall.Dup3(int(out.Fd()), 2, 0); err != nil {
+		return err
+	}
+	if err := os.Chdir(dir); err != nil {
+		return err
+	}
+	env := []string{
+		"HOME=" + dir + "/" + gameDir + "/home",
+		"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+		"TERM=xterm",
+		"LANG=C.UTF-8",
+		"LD_LIBRARY_PATH=" + dir + ":" + dir + "/RustDedicated_Data/Plugins/x86_64",
+	}
+	if spec.Carbon {
+		if info, err := os.Stat(dir + "/libdoorstop.so"); err == nil && info.Mode().IsRegular() {
+			env = append(env, "DOORSTOP_ENABLED=1", "DOORSTOP_TARGET_ASSEMBLY="+dir+"/carbon/managed/Carbon.Preloader.dll", "LD_PRELOAD="+dir+"/libdoorstop.so")
+		}
+	}
+	argv := append([]string{exe, "-logfile", dir + "/" + serverLog}, spec.Args...)
+	return syscall.Exec(exe, argv, env)
+}
 
-	cmd := exec.Command(s.Exe(), append([]string{"-logfile", s.LogPath()}, args...)...)
-	cmd.Dir = s.Dir()
-	cmd.Env = s.environment(carbon)
-	cmd.Stdout, cmd.Stderr = out, out
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("server did not start: %v", err)
+// rotateLog: Rust overwrites server.log on every start; the previous one becomes .rerust/logs/server-<time>.log and
+// only the newest KeepLogs stay. All through the jail.
+func (a *Agent) rotateLog(j *jail.Jail) {
+	if info, err := j.Lstat(serverLog); err == nil && info.Mode().IsRegular() && info.Size() > 0 {
+		if _, err := j.MkdirAll(oldLogs); err == nil {
+			base := oldLogs + "/server-" + info.ModTime().Format("20060102-150405")
+			target := base + ".log"
+			for n := 2; j.IsFile(target) && n < 100; n++ {
+				target = fmt.Sprintf("%s-%d.log", base, n)
+			}
+			_ = j.Rename(serverLog, target)
+		}
 	}
-	pid := cmd.Process.Pid
-	exited := make(chan struct{})
-	go func() { _ = cmd.Wait(); close(exited) }() // reap it whenever it ends
-	select {
-	case <-exited:
-		return 0, fmt.Errorf("%s exited immediately after starting (check its log)", Executable)
-	case <-time.After(500 * time.Millisecond):
+	entries, _ := j.ReadDir(oldLogs)
+	var names []string
+	for _, e := range entries {
+		if rotatedLog.MatchString(e.Name()) {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Sort(sort.Reverse(sort.StringSlice(names)))
+	for i, n := range names {
+		if i >= KeepLogs {
+			_ = j.Remove(oldLogs + "/" + n)
+		}
+	}
+}
+
+// start writes the launch file and has systemd start the server's unit.
+func (a *Agent) start(s *Server, args []string, carbon bool) (int, error) {
+	if err := validArgs(args); err != nil {
+		return 0, err
+	}
+	j, err := jail.Open(s.Dir())
+	if err != nil {
+		return 0, fmt.Errorf("%s not found in %s. Install the server first", Executable, s.Dir())
+	}
+	defer j.Close()
+	if info, err := j.Lstat(Executable); err != nil || !info.Mode().IsRegular() {
+		return 0, fmt.Errorf("%s not found in %s. Install the server first", Executable, s.Dir())
+	} else if info.Mode()&0o111 == 0 {
+		return 0, fmt.Errorf("%s is not executable (chmod +x)", Executable)
+	}
+	if pid := a.sup.MainPID(s.Slug); pid > 0 {
+		return 0, fmt.Errorf("the server is already running (process %d)", pid)
+	}
+	if _, err := j.MkdirAll(gameDir); err != nil {
+		return 0, err
+	}
+	a.rotateLog(j)
+	raw, _ := json.Marshal(LaunchSpec{Args: args, Carbon: carbon})
+	if err := j.WriteAtomic(launchFile, raw, 0o640); err != nil {
+		return 0, err
+	}
+	pid, err := a.sup.Start(s.Slug)
+	if err != nil {
+		return 0, err
 	}
 	recordStart(s, args)
 	return pid, nil
 }
 
-// recordStart keeps the arguments of the last start (without the RCON password) for taking the server over later.
+// recordStart keeps the arguments of the last start (without the RCON password) in the agent's own folder.
 func recordStart(s *Server, args []string) {
 	kept := make([]string, 0, len(args))
 	for i := 0; i < len(args); i++ {
-		if args[i] == "+rcon.password" {
+		if strings.EqualFold(strings.TrimLeft(args[i], "+-"), "rcon.password") {
 			i++ // never on disk outside the panel's database
 			continue
 		}
 		kept = append(kept, args[i])
 	}
 	raw, _ := json.Marshal(map[string]any{"args": kept, "at": time.Now().Unix()})
-	_ = os.WriteFile(s.LogDir()+"/last-start.json", raw, 0o640)
+	_ = os.WriteFile(s.LogDir()+"/last-start.json", raw, 0o600)
 }
 
 func lastStart(state, slug string) any {
@@ -259,6 +197,42 @@ func lastStart(state, slug string) any {
 	return map[string]any{"args": args, "at": d.At}
 }
 
+/* ---------- /proc (read-only: the game runs as another user) ---------- */
+
+func running(pid int) bool {
+	raw, err := os.ReadFile(procRoot() + "/" + strconv.Itoa(pid) + "/status")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(raw), "\n") {
+		if v, ok := strings.CutPrefix(line, "State:"); ok {
+			return !strings.HasPrefix(strings.TrimSpace(v), "Z")
+		}
+	}
+	return true
+}
+
+// rustInfo is {pid, memory_kb} when pid is a live RustDedicated.
+func rustInfo(pid int) map[string]any {
+	if pid <= 0 || procComm(pid) != commName || !running(pid) {
+		return nil
+	}
+	kb := max(sysstats.RSSBytes(pid)/1024, 0)
+	return map[string]any{"pid": pid, "memory_kb": kb}
+}
+
+// commandLine of a process (world-readable in /proc).
+func commandLine(pid int) []string {
+	if pid <= 0 || !running(pid) {
+		return nil
+	}
+	raw, err := os.ReadFile(procRoot() + "/" + strconv.Itoa(pid) + "/cmdline")
+	if err != nil || len(raw) == 0 {
+		return nil
+	}
+	return strings.Split(strings.TrimRight(string(raw), "\x00"), "\x00")
+}
+
 /* ---------- handlers ---------- */
 
 func (a *Agent) processStart(w http.ResponseWriter, r *http.Request, s *Server) {
@@ -280,6 +254,19 @@ func (a *Agent) processStart(w http.ResponseWriter, r *http.Request, s *Server) 
 	writeJSON(w, 200, map[string]any{"pid": pid})
 }
 
+// info: this server's running RustDedicated with this PID (the unit's own process), or nil.
+func (a *Agent) info(s *Server, pid int, fresh bool) map[string]any {
+	if pid <= 0 || a.sup.MainPID(s.Slug) != pid {
+		return nil
+	}
+	if !fresh {
+		if p, ok := a.Stats.RecentProcess(pid, 6); ok {
+			return map[string]any{"pid": pid, "memory_kb": p.MemBytes / 1024}
+		}
+	}
+	return rustInfo(pid)
+}
+
 func (a *Agent) processInfo(w http.ResponseWriter, r *http.Request, s *Server) {
 	in, _ := readInput(r)
 	pid, ok := in.integer("pid")
@@ -294,30 +281,12 @@ func (a *Agent) processInfo(w http.ResponseWriter, r *http.Request, s *Server) {
 	writeJSON(w, 200, map[string]any{"pid": nil})
 }
 
-// info: this server's running RustDedicated with this PID, or nil. A recent monitor sample proves it alive cheaply;
-// a miss is not trusted (the process may be newer than the sample).
-func (a *Agent) info(s *Server, pid int, fresh bool) map[string]any {
-	if !s.owns(pid) {
-		return nil
-	}
-	if !fresh {
-		if p, ok := a.Stats.RecentProcess(pid, 6); ok {
-			return map[string]any{"pid": pid, "memory_kb": p.MemBytes / 1024}
-		}
-	}
-	return rustInfo(pid)
-}
-
 func (a *Agent) processFind(w http.ResponseWriter, r *http.Request, s *Server) {
-	writeJSON(w, 200, map[string]any{"pids": findByExecutable(s.Exe())})
-}
-
-// assertOwn refuses a running RustDedicated of another server; a PID that is gone or not a Rust server passes.
-func assertOwn(s *Server, pid int) error {
-	if !s.owns(pid) && rustInfo(pid) != nil {
-		return fmt.Errorf("process %d belongs to another server", pid)
+	pids := []int{}
+	if pid := a.sup.MainPID(s.Slug); pid > 0 && rustInfo(pid) != nil {
+		pids = append(pids, pid)
 	}
-	return nil
+	writeJSON(w, 200, map[string]any{"pids": pids})
 }
 
 func (a *Agent) processKill(w http.ResponseWriter, r *http.Request, s *Server) {
@@ -330,15 +299,20 @@ func (a *Agent) processKill(w http.ResponseWriter, r *http.Request, s *Server) {
 		invalid(w, "The pid field is required.")
 		return
 	}
-	if err := assertOwn(s, int(pid)); err != nil {
-		fail(w, 409, "not_this_server", upperFirst(err.Error())+".")
-		return
-	}
-	if rustInfo(int(pid)) == nil {
+	main := a.sup.MainPID(s.Slug)
+	if main != int(pid) {
+		if rustInfo(int(pid)) != nil {
+			fail(w, 409, "not_this_server", fmt.Sprintf("Process %d belongs to another server.", pid))
+			return
+		}
 		writeJSON(w, 200, map[string]any{"killed": false})
 		return
 	}
-	killGroup(int(pid), syscall.SIGKILL) // no verified SIGTERM save in Rust: the panel saves over RCON first
+	// No verified SIGTERM save in Rust: the panel saves over RCON first, then the unit is killed.
+	if err := a.sup.Kill(s.Slug); err != nil {
+		fail(w, 409, "not_this_server", upperFirst(err.Error())+".")
+		return
+	}
 	writeJSON(w, 200, map[string]any{"killed": true})
 }
 
@@ -353,30 +327,25 @@ func (a *Agent) processAffinity(w http.ResponseWriter, r *http.Request, s *Serve
 		invalid(w, "pid and cores (a list) are required.")
 		return
 	}
-	if err := assertOwn(s, int(pid)); err != nil {
-		fail(w, 409, "refused", upperFirst(err.Error())+".")
-		return
-	}
-	if a.info(s, int(pid), true) == nil {
+	if a.sup.MainPID(s.Slug) != int(pid) {
+		if rustInfo(int(pid)) != nil {
+			fail(w, 409, "refused", fmt.Sprintf("Process %d belongs to another server.", pid))
+			return
+		}
 		writeJSON(w, 200, map[string]any{"applied": false})
 		return
 	}
 	count := cores()
-	parts := []string{}
+	coreList := make([]int, 0, len(list))
 	for _, c := range list {
 		if c < 0 || c >= int64(count) {
 			fail(w, 409, "refused", fmt.Sprintf("This machine has no core %d.", c))
 			return
 		}
-		parts = append(parts, strconv.FormatInt(c, 10))
+		coreList = append(coreList, int(c))
 	}
-	spec := strings.Join(parts, ",")
-	if spec == "" {
-		spec = fmt.Sprintf("0-%d", max(0, count-1))
-	}
-	// -a: every thread of the process.
-	if out, err := exec.Command("taskset", "-a", "-p", "-c", spec, strconv.Itoa(int(pid))).CombinedOutput(); err != nil {
-		fail(w, 409, "refused", "Could not set CPU affinity: "+strings.TrimSpace(string(out)))
+	if err := a.sup.SetCPUs(s.Slug, coreList); err != nil {
+		fail(w, 409, "refused", upperFirst(err.Error())+".")
 		return
 	}
 	writeJSON(w, 200, map[string]any{"applied": true})
@@ -388,3 +357,6 @@ func upperFirst(s string) string {
 	}
 	return strings.ToUpper(s[:1]) + s[1:]
 }
+
+// fileExists reports anything at p (also a link).
+func fileExists(p string) bool { _, err := os.Lstat(p); return err == nil }

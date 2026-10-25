@@ -19,19 +19,19 @@ import (
 // Executable is the game's binary name inside a server folder.
 const Executable = "RustDedicated"
 
-// Server is one registered server: its folder is always <base>/<slug>, its console logs <state>/servers/<slug>.
+// Server is one registered server: its folder is always <base>/<slug>; the agent's own notes about it (last start,
+// mod manifest) are in <state>/servers/<slug>, where the game can't reach them.
 type Server struct {
-	Slug     string `json:"slug"`
-	Identity string `json:"identity"`
+	Slug     string
+	Identity string
+	RconPort int
 	base     string
 	state    string
 }
 
-func (s *Server) Dir() string        { return s.base + "/" + s.Slug }
-func (s *Server) Exe() string        { return s.Dir() + "/" + Executable }
-func (s *Server) Installed() bool    { return jail.IsFile(s.Exe()) }
-func (s *Server) LogPath() string    { return s.LogDir() + "/server.log" }
-func (s *Server) OutputPath() string { return s.LogDir() + "/server.output.log" }
+func (s *Server) Dir() string     { return s.base + "/" + s.Slug }
+func (s *Server) Exe() string     { return s.Dir() + "/" + Executable }
+func (s *Server) Installed() bool { return jail.IsFile(s.Exe()) }
 
 // SafeIdentity is the identity with anything but letters, digits, _ and - removed (the panel's safeIdentity).
 func (s *Server) SafeIdentity() string {
@@ -47,10 +47,28 @@ func (s *Server) SafeIdentity() string {
 	return b.String()
 }
 
+// ensureDir creates the server's own folder (<base>/<slug>) when missing - never through a link. The servers folder
+// is setgid with the game's group (install.sh), so the new folder and everything in it get that group and the setgid
+// bit from the kernel: the agent and the game both work in it. Never set here - the agent's unit forbids making
+// setgid files (RestrictSUIDSGID), and a chmod would clear the inherited bit.
+func (s *Server) ensureDir() error {
+	info, err := os.Lstat(s.Dir())
+	if err == nil {
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s is not a folder", s.Dir())
+		}
+		return nil
+	}
+	if err := os.Mkdir(s.Dir(), 0o770); err != nil && !jail.IsDir(s.Dir()) {
+		return fmt.Errorf("could not create %s", s.Dir())
+	}
+	return nil
+}
+
 // LogDir is created when missing.
 func (s *Server) LogDir() string {
 	dir := logDirFor(s.state, s.Slug)
-	_ = os.MkdirAll(dir, 0o750)
+	_ = os.MkdirAll(dir, 0o700)
 	return dir
 }
 
@@ -62,18 +80,30 @@ func (s *Server) BackupDir() string { return s.base + "/_backups/" + s.Slug }
 // SaveDir is the identity's save folder.
 func (s *Server) SaveDir() string { return s.Dir() + "/server/" + s.SafeIdentity() }
 
+type entry struct {
+	Identity string `json:"identity"`
+	RconPort int    `json:"rcon_port,omitempty"`
+}
+
 type registry struct {
 	path string
 	mu   sync.Mutex
-	m    map[string]string // slug -> identity
+	m    map[string]entry
 }
 
 func openRegistry(path string) (*registry, error) {
-	r := &registry{path: path, m: map[string]string{}}
+	r := &registry{path: path, m: map[string]entry{}}
 	raw, err := os.ReadFile(path)
 	if err == nil {
 		if err := json.Unmarshal(raw, &r.m); err != nil {
-			return nil, fmt.Errorf("%s: %w", path, err)
+			// v0.1 stored slug -> identity
+			var old map[string]string
+			if json.Unmarshal(raw, &old) != nil {
+				return nil, fmt.Errorf("%s: %w", path, err)
+			}
+			for k, v := range old {
+				r.m[k] = entry{Identity: v}
+			}
 		}
 	} else if !os.IsNotExist(err) {
 		return nil, err
@@ -86,18 +116,31 @@ func (r *registry) save() error {
 	return config.WriteAtomic(r.path, raw, 0o640)
 }
 
-func (r *registry) get(slug string) (string, bool) {
+func (r *registry) get(slug string) (entry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	id, ok := r.m[slug]
-	return id, ok
+	e, ok := r.m[slug]
+	return e, ok
 }
 
-func (r *registry) set(slug, identity string) error {
+func (r *registry) set(slug string, e entry) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.m[slug] = identity
+	r.m[slug] = e
 	return r.save()
+}
+
+// rconPorts is every registered server's RCON port - the only ports /rcon/ passes through to.
+func (r *registry) rconPorts() map[int]bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := map[int]bool{}
+	for _, e := range r.m {
+		if e.RconPort > 0 {
+			out[e.RconPort] = true
+		}
+	}
+	return out
 }
 
 func (r *registry) remove(slug string) error {
@@ -117,21 +160,22 @@ func (r *registry) slugs() map[string]bool {
 	return out
 }
 
-func (a *Agent) server(slug, identity string) *Server {
-	return &Server{Slug: slug, Identity: identity, base: a.Cfg.BaseDir, state: a.Cfg.StateDir}
+func (a *Agent) server(slug string, e entry) *Server {
+	return &Server{Slug: slug, Identity: e.Identity, RconPort: e.RconPort, base: a.Cfg.BaseDir, state: a.Cfg.StateDir}
 }
 
 // find is a registered server, or a 404 in the agent's format.
 func (a *Agent) find(w http.ResponseWriter, slug string) (*Server, bool) {
-	identity, ok := "", false
+	var e entry
+	ok := false
 	if slugPattern.MatchString(slug) {
-		identity, ok = a.servers.get(slug)
+		e, ok = a.servers.get(slug)
 	}
 	if !ok {
 		fail(w, 404, "unknown_server", "This node doesn't manage a server called "+slug+".")
 		return nil, false
 	}
-	return a.server(slug, identity), true
+	return a.server(slug, e), true
 }
 
 func (a *Agent) describe(s *Server) map[string]any {
@@ -209,11 +253,22 @@ func (a *Agent) register(w http.ResponseWriter, r *http.Request) {
 		invalid(w, "The identity field format is invalid.")
 		return
 	}
-	if err := a.servers.set(slug, identity); err != nil {
+	e := entry{Identity: identity}
+	if in.has("rcon_port") {
+		port, ok := in.integer("rcon_port")
+		if !ok || port < 1024 || port > 65535 {
+			invalid(w, "The rcon port must be 1024 - 65535.")
+			return
+		}
+		e.RconPort = int(port)
+	} else if old, ok := a.servers.get(slug); ok {
+		e.RconPort = old.RconPort // an older panel doesn't send it
+	}
+	if err := a.servers.set(slug, e); err != nil {
 		fail(w, 500, "failed", err.Error())
 		return
 	}
-	writeJSON(w, 200, a.describe(a.server(slug, identity)))
+	writeJSON(w, 200, a.describe(a.server(slug, e)))
 }
 
 // destroy removes a server from this node: its folder is moved into <base>/_deleting at once (fails cleanly when a
@@ -224,13 +279,18 @@ func (a *Agent) destroy(w http.ResponseWriter, r *http.Request) {
 		fail(w, 404, "not_found", "Unknown agent address.")
 		return
 	}
-	identity, _ := a.servers.get(slug)
-	if identity == "" {
-		identity = slug
+	e, _ := a.servers.get(slug)
+	if e.Identity == "" {
+		e.Identity = slug
 	}
-	srv := a.server(slug, identity)
+	srv := a.server(slug, e)
 	if a.jobs.busy(slug) != nil {
 		fail(w, 409, "busy", "A job is still running for this server on its machine.")
+		return
+	}
+	// A running game would keep writing into the folder while it is deleted.
+	if a.sup.MainPID(slug) > 0 {
+		fail(w, 409, "running", "The server is still running - stop it first.")
 		return
 	}
 	trashed, err := a.moveToTrash(srv)

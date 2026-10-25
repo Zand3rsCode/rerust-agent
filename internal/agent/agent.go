@@ -40,6 +40,7 @@ type Agent struct {
 
 	servers *registry
 	jobs    *jobs
+	sup     Supervisor
 	update  *updater
 	mux     *http.ServeMux
 
@@ -47,9 +48,12 @@ type Agent struct {
 	failures map[string][]time.Time
 }
 
-// New builds the agent (the state folder must exist).
-func New(version string, cfg config.Config, store *auth.Store, stats *sysstats.Sampler) (*Agent, error) {
-	a := &Agent{Version: version, Cfg: cfg, Auth: store, Stats: stats, failures: map[string][]time.Time{}}
+// New builds the agent (the state folder must exist). sup nil = systemd (tests pass a fake).
+func New(version string, cfg config.Config, store *auth.Store, stats *sysstats.Sampler, sup Supervisor) (*Agent, error) {
+	if sup == nil {
+		sup = systemdSupervisor{}
+	}
+	a := &Agent{Version: version, Cfg: cfg, Auth: store, Stats: stats, sup: sup, failures: map[string][]time.Time{}}
 	var err error
 	if a.servers, err = openRegistry(cfg.StateDir + "/servers.json"); err != nil {
 		return nil, err
@@ -130,21 +134,10 @@ func (a *Agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-ReRust-Agent", a.Version+"; protocol=1")
 	ip := clientIP(r)
 	loopback := ip == "127.0.0.1" || ip == "::1"
+	rcon := strings.HasPrefix(r.URL.Path, "/rcon/")
 
-	if strings.HasPrefix(r.URL.Path, "/rcon/") {
-		if !loopback && !a.ipAllowed(ip) {
-			http.Error(w, "forbidden", http.StatusForbidden)
-			return
-		}
-		a.rcon(w, r)
-		return
-	}
-	if !strings.HasPrefix(r.URL.Path, "/agent/v1/") {
+	if !rcon && !strings.HasPrefix(r.URL.Path, "/agent/v1/") {
 		fail(w, 404, "not_found", "Unknown agent address.")
-		return
-	}
-	if a.tooManyFailures(ip) {
-		fail(w, 429, "too_many_attempts", "Too many wrong keys. Try again later.")
 		return
 	}
 	if !loopback && !a.ipAllowed(ip) {
@@ -155,15 +148,33 @@ func (a *Agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		fail(w, 403, "https_required", "The agent only answers over HTTPS.")
 		return
 	}
-	_, pattern := a.mux.Handler(r)
+	pattern := ""
+	if !rcon {
+		_, pattern = a.mux.Handler(r)
+	}
 	if pattern == "POST /agent/v1/pair" {
+		// The one call without a key: guarded by its one-time secret, a small body and the wrong-try limit.
+		if a.tooManyFailures(ip) {
+			fail(w, 429, "too_many_attempts", "Too many wrong tries. Try again later.")
+			return
+		}
 		a.mux.ServeHTTP(w, r)
 		return
 	}
+	// The right key is never blocked - only wrong ones are counted and limited, so someone else at the panel's
+	// address (shared hosting) can't lock the panel out.
 	key, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !a.Auth.KeyOK(strings.TrimSpace(key)) {
+		if a.tooManyFailures(ip) {
+			fail(w, 429, "too_many_attempts", "Too many wrong keys. Try again later.")
+			return
+		}
 		a.failed(ip)
 		fail(w, 401, "bad_key", "Missing or wrong node key.")
+		return
+	}
+	if rcon {
+		a.rcon(w, r)
 		return
 	}
 	if pattern == "" {

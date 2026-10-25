@@ -13,8 +13,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
-	"path/filepath"
+	"os/exec"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -30,37 +32,52 @@ import (
 //go:embed release_key.pub.pem
 var releaseKey []byte
 
-// VerifySums checks SHA256SUMS against its signature.
-func VerifySums(sums, sig []byte) error {
+// Asset is this machine's agent binary in a release.
+func Asset() string { return "rerust-agent-linux-" + runtime.GOARCH }
+
+var versionLine = regexp.MustCompile(`^# rerust-agent (\d+\.\d+\.\d+)$`)
+
+// VerifyRelease checks SHA256SUMS against its signature and returns the version it names (its first line,
+// "# rerust-agent x.y.z" - signed, so an old release can't be passed off under a newer tag).
+func VerifyRelease(sums, sig []byte) (string, error) {
 	block, _ := pem.Decode(releaseKey)
 	if block == nil {
-		return errors.New("no release key built in")
+		return "", errors.New("no release key built in")
 	}
 	key, err := x509.ParsePKIXPublicKey(block.Bytes)
 	if err != nil {
-		return err
+		return "", err
 	}
 	pub, ok := key.(ed25519.PublicKey)
 	if !ok || !ed25519.Verify(pub, sums, sig) {
-		return errors.New("the release's signature is not valid - refusing to install it")
+		return "", errors.New("the release's signature is not valid - refusing to install it")
 	}
-	return nil
+	first, _, _ := strings.Cut(string(sums), "\n")
+	m := versionLine.FindStringSubmatch(strings.TrimSpace(first))
+	if m == nil {
+		return "", errors.New("the signed SHA256SUMS names no version - refusing to install it")
+	}
+	return m[1], nil
 }
 
 // SumFor is the sha256 listed for name in SHA256SUMS ("<hex>  <name>" lines).
 func SumFor(sums []byte, name string) (string, bool) {
 	sc := bufio.NewScanner(strings.NewReader(string(sums)))
+	found := ""
 	for sc.Scan() {
 		f := strings.Fields(sc.Text())
 		if len(f) == 2 && strings.TrimPrefix(f[1], "*") == name && len(f[0]) == 64 {
-			return strings.ToLower(f[0]), true
+			if found != "" {
+				return "", false // listed twice: refuse
+			}
+			found = strings.ToLower(f[0])
 		}
 	}
-	return "", false
+	return found, found != ""
 }
 
-// newer: a > b for x.y.z versions (a leading v is ignored).
-func newer(a, b string) bool {
+// Newer: a > b for x.y.z versions (a leading v is ignored).
+func Newer(a, b string) bool {
 	pa, pb := versionParts(a), versionParts(b)
 	for i := 0; i < 3; i++ {
 		if pa[i] != pb[i] {
@@ -79,8 +96,58 @@ func versionParts(v string) [3]int {
 	return out
 }
 
+// releaseHosts the agent downloads releases from (https only; redirects must stay on them).
+var releaseHosts = map[string]bool{"github.com": true, "objects.githubusercontent.com": true, "release-assets.githubusercontent.com": true}
+
+// testHosts: tests may serve releases from these (never set outside tests).
+var testHosts = map[string]bool{}
+
+func allowedDownload(u *url.URL) bool {
+	if testHosts[u.Host] {
+		return true
+	}
+	return u.Scheme == "https" && u.User == nil && releaseHosts[strings.ToLower(u.Hostname())] && u.Port() == ""
+}
+
+var downloadClient = &http.Client{
+	Timeout: 5 * time.Minute,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 5 || !allowedDownload(req.URL) {
+			return errors.New("redirect to an address that is not GitHub's")
+		}
+		return nil
+	},
+}
+
+func download(link string, limit int64) ([]byte, error) {
+	u, err := url.Parse(link)
+	if err != nil || !allowedDownload(u) {
+		return nil, fmt.Errorf("refusing to download from %s", link)
+	}
+	resp, err := downloadClient.Get(link)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("download failed with HTTP %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err == nil && int64(len(data)) > limit {
+		err = errors.New("the download is larger than expected")
+	}
+	return data, err
+}
+
+// UpdateDir is where the agent leaves a downloaded release for the root update step.
+func UpdateDir(stateDir string) string { return stateDir + "/update" }
+
+// UpdateStatusFile is written by the root update step (systemd RuntimeDirectory, readable by the agent). A variable
+// only for tests.
+var UpdateStatusFile = "/run/rerust-agent-update/status.json"
+
 type updateRun struct {
-	State   string `json:"state"` // running | done | failed
+	State   string `json:"state"` // downloading | installing | done | failed
 	From    string `json:"from"`
 	To      string `json:"to"`
 	Message string `json:"message,omitempty"`
@@ -91,30 +158,27 @@ type updater struct {
 	a    *Agent
 	mu   sync.Mutex
 	busy bool
-	// Exit is called after the new binary is in place (systemd starts it again). Tests replace it.
-	Exit func()
 	// API is GitHub's API (tests point it elsewhere).
 	API string
+	// Trigger starts the root update step (tests replace it).
+	Trigger func() error
 }
 
 func newUpdater(a *Agent) *updater {
-	return &updater{a: a, API: "https://api.github.com", Exit: func() { os.Exit(0) }}
+	return &updater{a: a, API: "https://api.github.com", Trigger: func() error {
+		out, err := exec.Command("systemctl", "--no-ask-password", "start", "--no-block", "rerust-agent-update.service").CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("could not start the update: %s", strings.TrimSpace(string(out)))
+		}
+		return nil
+	}}
 }
 
 func (u *updater) statePath() string { return u.a.Cfg.StateDir + "/update.json" }
-func (u *updater) logPath() string   { return u.a.Cfg.StateDir + "/update.log" }
 
 func (u *updater) save(run updateRun) {
 	raw, _ := json.Marshal(run)
-	_ = config.WriteAtomic(u.statePath(), raw, 0o640)
-}
-
-func (u *updater) log(line string) {
-	f, err := os.OpenFile(u.logPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o640)
-	if err == nil {
-		fmt.Fprintf(f, "[%s] %s\n", time.Now().UTC().Format("2006-01-02 15:04:05"), line)
-		f.Close()
-	}
+	_ = config.WriteAtomic(u.statePath(), raw, 0o600)
 }
 
 type release struct {
@@ -124,8 +188,6 @@ type release struct {
 		URL  string `json:"browser_download_url"`
 	} `json:"assets"`
 }
-
-var httpClient = &http.Client{Timeout: 5 * time.Minute}
 
 func (u *updater) latest() (*release, error) {
 	req, _ := http.NewRequest("GET", u.API+"/repos/"+u.a.Cfg.UpdateRepo+"/releases/latest", nil)
@@ -145,23 +207,10 @@ func (u *updater) latest() (*release, error) {
 	return &rel, nil
 }
 
-func download(link string, limit int64) ([]byte, error) {
-	if !strings.HasPrefix(link, "https://github.com/") && !strings.HasPrefix(link, "https://objects.githubusercontent.com/") && !strings.HasPrefix(link, "http://127.0.0.1") {
-		return nil, fmt.Errorf("refusing to download from %s", link)
-	}
-	resp, err := httpClient.Get(link)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("download failed with HTTP %d", resp.StatusCode)
-	}
-	return io.ReadAll(io.LimitReader(resp.Body, limit))
-}
+var errUpToDate = errors.New("up to date")
 
-// startUpdate: update this agent to the newest release (the panel may send its own version - ignored: the agent's
-// versions are its own).
+// startUpdate: download the newest release, check it, and hand it to the root update step. The agent can't replace
+// its own program (it belongs to root) - so a game server can't either.
 func (a *Agent) startUpdate(w http.ResponseWriter, r *http.Request) {
 	u := a.update
 	u.mu.Lock()
@@ -173,13 +222,11 @@ func (a *Agent) startUpdate(w http.ResponseWriter, r *http.Request) {
 	u.busy = true
 	u.mu.Unlock()
 	rel, err := u.latest()
-	if err == nil && !newer(rel.Tag, a.Version) {
+	if err == nil && !Newer(rel.Tag, a.Version) {
 		err = errUpToDate
 	}
 	if err != nil {
-		u.mu.Lock()
-		u.busy = false
-		u.mu.Unlock()
+		u.done()
 		if errors.Is(err, errUpToDate) {
 			fail(w, 409, "up_to_date", "This machine already runs the newest agent (v"+strings.TrimPrefix(a.Version, "v")+").")
 			return
@@ -188,37 +235,33 @@ func (a *Agent) startUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	to := strings.TrimPrefix(rel.Tag, "v")
-	run := updateRun{State: "running", From: a.Version, To: to, At: time.Now().Unix()}
+	run := updateRun{State: "downloading", From: a.Version, To: to, At: time.Now().Unix()}
 	u.save(run)
-	go u.install(rel, run)
+	go u.fetch(rel, run)
 	writeJSON(w, 200, map[string]any{"started": true, "from": a.Version, "to": to})
 }
 
-var errUpToDate = errors.New("up to date")
+func (u *updater) done() {
+	u.mu.Lock()
+	u.busy = false
+	u.mu.Unlock()
+}
 
-func (u *updater) install(rel *release, run updateRun) {
+func (u *updater) fetch(rel *release, run updateRun) {
+	defer u.done()
 	finish := func(err error) {
-		u.mu.Lock()
-		u.busy = false
-		u.mu.Unlock()
-		if err != nil {
-			u.log("ERROR: " + err.Error() + " Nothing was changed.")
-			run.State, run.Message = "failed", err.Error()+" Nothing was changed."
-		} else {
-			run.State = "done"
-		}
+		run.State, run.Message = "failed", err.Error()+" Nothing was changed."
 		u.save(run)
 	}
-	asset := "rerust-agent-linux-" + runtime.GOARCH
 	links := map[string]string{}
 	for _, a := range rel.Assets {
 		links[a.Name] = a.URL
 	}
+	asset := Asset()
 	if links[asset] == "" || links["SHA256SUMS"] == "" || links["SHA256SUMS.sig"] == "" {
-		finish(fmt.Errorf("release %s has no %s, SHA256SUMS and SHA256SUMS.sig", rel.Tag, asset))
+		finish(fmt.Errorf("release %s has no %s, SHA256SUMS and SHA256SUMS.sig.", rel.Tag, asset))
 		return
 	}
-	u.log("Updating from v" + run.From + " to v" + run.To + "...")
 	sums, err := download(links["SHA256SUMS"], 1<<16)
 	if err != nil {
 		finish(err)
@@ -229,13 +272,17 @@ func (u *updater) install(rel *release, run updateRun) {
 		finish(err)
 		return
 	}
-	if err := VerifySums(sums, sig); err != nil {
+	version, err := VerifyRelease(sums, sig)
+	if err == nil && version != run.To {
+		err = fmt.Errorf("the release is tagged v%s but its signed version is %s", run.To, version)
+	}
+	if err != nil {
 		finish(err)
 		return
 	}
 	want, ok := SumFor(sums, asset)
 	if !ok {
-		finish(errors.New("SHA256SUMS does not list " + asset))
+		finish(errors.New("SHA256SUMS does not list " + asset + " once"))
 		return
 	}
 	bin, err := download(links[asset], 200<<20)
@@ -248,28 +295,19 @@ func (u *updater) install(rel *release, run updateRun) {
 		finish(errors.New("the downloaded agent's checksum differs"))
 		return
 	}
-	self, err := os.Executable()
-	if err == nil {
-		self, err = filepath.EvalSymlinks(self)
+	dir := UpdateDir(u.a.Cfg.StateDir)
+	_ = os.MkdirAll(dir, 0o700)
+	for name, data := range map[string][]byte{"SHA256SUMS": sums, "SHA256SUMS.sig": sig, asset: bin} {
+		if err := config.WriteAtomic(dir+"/"+name, data, 0o600); err != nil {
+			finish(err)
+			return
+		}
 	}
-	if err != nil {
+	run.State = "installing"
+	u.save(run)
+	if err := u.Trigger(); err != nil {
 		finish(err)
-		return
 	}
-	tmp := self + ".new"
-	if err := os.WriteFile(tmp, bin, 0o755); err != nil {
-		finish(fmt.Errorf("could not write %s: %v", tmp, err))
-		return
-	}
-	if err := os.Rename(tmp, self); err != nil {
-		_ = os.Remove(tmp)
-		finish(fmt.Errorf("could not replace %s: %v", self, err))
-		return
-	}
-	u.log("Installed v" + run.To + " - restarting the agent (game servers keep running).")
-	finish(nil)
-	time.Sleep(500 * time.Millisecond)
-	u.Exit()
 }
 
 func (a *Agent) updateStatus(w http.ResponseWriter, r *http.Request) {
@@ -278,16 +316,20 @@ func (a *Agent) updateStatus(w http.ResponseWriter, r *http.Request) {
 	if raw, err := os.ReadFile(u.statePath()); err == nil {
 		_ = json.Unmarshal(raw, &run)
 	}
+	// The root step's own answer, when it has run for this update.
+	var root map[string]any
+	if raw, err := os.ReadFile(UpdateStatusFile); err == nil && json.Unmarshal(raw, &root) == nil && run != nil {
+		if at, _ := root["at"].(float64); int64(at) >= int64(toFloat(run["at"])) {
+			run["state"], run["message"] = root["state"], root["message"]
+		}
+	}
 	if run == nil {
 		run = map[string]any{}
 	}
 	u.mu.Lock()
 	run["busy"] = u.busy
 	u.mu.Unlock()
-	t := tail(u.logPath(), 0, 16384)
-	lines, _ := t["lines"].([]string)
-	if len(lines) > 30 {
-		lines = lines[len(lines)-30:]
-	}
-	writeJSON(w, 200, map[string]any{"version": a.Version, "run": run, "lines": lines})
+	writeJSON(w, 200, map[string]any{"version": a.Version, "run": run, "lines": []string{}})
 }
+
+func toFloat(v any) float64 { f, _ := v.(float64); return f }

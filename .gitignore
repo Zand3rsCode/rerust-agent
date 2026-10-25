@@ -5,3 +5,8 @@
 # Signing keys never go into the repo.
 *.key
 *.sec
+# Release tooling stays on the dev PC (owner, 2026-10-25).
+/scripts/
+# Keys never go into the repo - only the public release key.
+*.pem
+!internal/agent/release_key.pub.pem

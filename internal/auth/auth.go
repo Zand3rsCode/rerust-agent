@@ -1,6 +1,6 @@
 // Package auth keeps the machine key (only its sha256) and a pending pairing in <state>/auth.json.
 //
-// Pairing: `rerust-agent pair` makes a one-time secret (valid PairHours) and prints a pairing code = the agent's
+// Pairing: `rerust-agent pair` makes a one-time secret (valid PairMinutes) and prints a pairing code = the agent's
 // certificate fingerprint + that secret. The panel checks the certificate against the fingerprint, then sends the
 // secret with a new machine key (POST /agent/v1/pair). From then on only that key works; the secret is gone. A new
 // pairing (moving the machine to another panel, a lost key) replaces the key only once it has completed.
@@ -17,13 +17,14 @@ import (
 	"os"
 	"regexp"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Zand3rsCode/rerust-agent/internal/config"
 )
 
-// PairHours is how long a pairing code works.
-const PairHours = 24
+// PairMinutes is how long a pairing code works.
+const PairMinutes = 60
 
 // KeyPattern is the panel's machine key format (Node::KEY_PATTERN): rn_ + 48 characters.
 var KeyPattern = regexp.MustCompile(`^rn_[A-Za-z0-9]{48}$`)
@@ -41,6 +42,14 @@ type Store struct {
 	mu    sync.Mutex
 	d     data
 	mtime time.Time
+	ino   uint64 // every save renames a new file in: a new inode, also within one clock tick
+}
+
+func inode(info os.FileInfo) uint64 {
+	if st, ok := info.Sys().(*syscall.Stat_t); ok {
+		return st.Ino
+	}
+	return 0
 }
 
 // Open reads (or starts) the store.
@@ -61,7 +70,7 @@ func (s *Store) reload(force bool) error {
 		}
 		return err
 	}
-	if !force && info.ModTime().Equal(s.mtime) {
+	if !force && info.ModTime().Equal(s.mtime) && inode(info) == s.ino {
 		return nil
 	}
 	raw, err := os.ReadFile(s.path)
@@ -72,7 +81,7 @@ func (s *Store) reload(force bool) error {
 	if err := json.Unmarshal(raw, &d); err != nil {
 		return err
 	}
-	s.d, s.mtime = d, info.ModTime()
+	s.d, s.mtime, s.ino = d, info.ModTime(), inode(info)
 	return nil
 }
 
@@ -82,7 +91,7 @@ func (s *Store) save() error {
 		return err
 	}
 	if info, err := os.Stat(s.path); err == nil {
-		s.mtime = info.ModTime()
+		s.mtime, s.ino = info.ModTime(), inode(info)
 	}
 	return nil
 }
@@ -122,8 +131,12 @@ func (s *Store) Pending() bool {
 	return s.d.PairHash != "" && time.Now().Unix() < s.d.PairExpires
 }
 
-// NewPairing makes a one-time secret (replacing any earlier one) and returns it.
-func (s *Store) NewPairing() (string, error) {
+// ErrPaired: the machine already has a panel - a new pairing must be asked for explicitly (it replaces that panel).
+var ErrPaired = errors.New("this machine is already paired with a panel - add --replace to pair it with a new one (the current key stops working once the new pairing completes)")
+
+// NewPairing makes a one-time secret (replacing any earlier one) and returns it. On a paired machine only with
+// replace.
+func (s *Store) NewPairing(replace bool) (string, error) {
 	buf := make([]byte, 18)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err
@@ -131,16 +144,37 @@ func (s *Store) NewPairing() (string, error) {
 	secret := base64.RawURLEncoding.EncodeToString(buf)
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := s.lockFile()
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
 	if err := s.reload(true); err != nil {
 		return "", err
 	}
+	if s.d.KeyHash != "" && !replace {
+		return "", ErrPaired
+	}
 	s.d.PairHash = hash(secret)
-	s.d.PairExpires = time.Now().Add(PairHours * time.Hour).Unix()
+	s.d.PairExpires = time.Now().Add(PairMinutes * time.Minute).Unix()
 	return secret, s.save()
 }
 
+// lockFile: the `pair` command and the running agent both write auth.json - one at a time.
+func (s *Store) lockFile() (func(), error) {
+	f, err := os.OpenFile(s.path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() { _ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
+}
+
 // ErrPairing is a wrong, used or expired pairing secret.
-var ErrPairing = errors.New("this pairing code is wrong, used or expired - make a new one on the machine: sudo rerust-agent pair")
+var ErrPairing = errors.New("this pairing code is wrong, used or expired - make a new one on the machine: sudo -u rerust-agent /opt/rerust-agent/rerust-agent pair")
 
 // Pair completes a pairing: the secret must match the pending one; key becomes the only accepted key.
 func (s *Store) Pair(secret, key string) error {
@@ -149,6 +183,11 @@ func (s *Store) Pair(secret, key string) error {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	unlock, err := s.lockFile()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if err := s.reload(true); err != nil {
 		return err
 	}

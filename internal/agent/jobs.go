@@ -192,10 +192,14 @@ func (m *jobs) start(slug, kind string, params map[string]any) (*Job, error) {
 	if !jobTypes[kind] {
 		return nil, errors.New("unknown job type")
 	}
-	if other := m.busy(slug); other != nil {
-		return nil, errBusy{fmt.Sprintf("Another job (%s) is still running for %s.", other.Type, slug)}
-	}
 	m.mu.Lock()
+	// Checked and added under one lock: two requests at once can't both start a job for the same server.
+	for _, other := range m.all {
+		if other.Slug == slug && (other.State == Queued || other.State == Running) {
+			m.mu.Unlock()
+			return nil, errBusy{fmt.Sprintf("Another job (%s) is still running for %s.", other.Type, slug)}
+		}
+	}
 	j := &Job{ID: m.next, Slug: slug, Type: kind, Params: params, State: Queued, m: m}
 	m.next++
 	m.all[j.ID] = j
@@ -214,6 +218,9 @@ func (m *jobs) start(slug, kind string, params map[string]any) (*Job, error) {
 // Inline runs jobs synchronously (tests).
 var Inline = false
 
+// beforePerform runs as a job starts its work (tests hold jobs there).
+var beforePerform = func(*Job) {}
+
 func (m *jobs) run(j *Job) {
 	m.mu.Lock()
 	if j.State != Queued {
@@ -229,6 +236,7 @@ func (m *jobs) run(j *Job) {
 			j.finish(Failed, fmt.Sprint(r), nil)
 		}
 	}()
+	beforePerform(j)
 	result, err := m.perform(j)
 	switch {
 	case errors.Is(err, errCancelled):
@@ -247,11 +255,11 @@ func (m *jobs) perform(j *Job) (any, error) {
 	if j.Type == "delete_folder" {
 		return nil, a.deleteFolder(j, fmt.Sprint(j.Params["path"]))
 	}
-	identity, ok := a.servers.get(j.Slug)
+	e, ok := a.servers.get(j.Slug)
 	if !ok {
 		return nil, fmt.Errorf("this node doesn't manage a server called %s", j.Slug)
 	}
-	s := a.server(j.Slug, identity)
+	s := a.server(j.Slug, e)
 	str := func(k string) string { v, _ := j.Params[k].(string); return v }
 	switch j.Type {
 	case "install":
@@ -278,7 +286,8 @@ func (m *jobs) perform(j *Job) (any, error) {
 		}
 		return map[string]any{"name": name, "size": size}, nil
 	case "restore":
-		return a.restore(s, str("name"), j.log)
+		code, _ := j.Params["code"].(bool)
+		return a.restore(s, str("name"), code, j.log)
 	}
 	return nil, errors.New("unknown job type")
 }
@@ -359,6 +368,14 @@ func (a *Agent) jobStore(w http.ResponseWriter, r *http.Request, s *Server) {
 			return
 		}
 		params["name"] = v
+	}
+	if p.has("code") {
+		v, ok := p.boolean("code")
+		if !ok {
+			invalid(w, "params.code must be true or false.")
+			return
+		}
+		params["code"] = v
 	}
 	if (kind == "mod_install" || kind == "mod_remove") && params["framework"] == nil {
 		invalid(w, "Which mod framework?")
