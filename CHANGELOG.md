@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.7 - 2026-10-26
+- Fix: `--replace-php-agent` said "took over N folder(s)" but changed nothing when run from `/root` (the usual place):
+  the step runs as the game's user, which can't enter `/root`, so it stopped at once - and its error was hidden. The
+  server then couldn't be started by the new agent. It now runs from `/`, checks the result and warns about any folder
+  it could not open to the agent.
+- With `--replace-php-agent` the last step says to **Edit** the machine's existing entry in the panel (its servers stay
+  with it), not "Add machine".
+
 ## v0.2.6 - 2026-10-26
 - Package updates no longer restart the Rust servers. Ubuntu's automatic updates (`needrestart`) restarted every
   service using an updated library - when zlib was updated, a live Rust server was stopped and started again without

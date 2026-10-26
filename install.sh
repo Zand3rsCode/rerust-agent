@@ -567,15 +567,21 @@ servers_folder() {
     chown "$AGENT_USER:$GAME_USER" "$BASE_DIR"; chmod 2750 "$BASE_DIR"
     [[ $REPLACE_PHP -eq 1 ]] || return 0
     # Folders of the old install belong to the game's user: let its group (the agent) write them too. Done AS the
-    # game's user (it owns the files) - root never walks a folder a game server can change.
-    local dir n=0
+    # game's user (it owns the files) - root never walks a folder a game server can change. From / : find stops
+    # when it can't go back to where it started, and sudo leaves us in /root (v0.2.6 changed nothing and said "ok").
+    local dir n=0 failed=()
     for dir in "$BASE_DIR"/*/; do
         dir=${dir%/}
         [[ -d $dir && ! -L $dir && $(stat -c %U "$dir") == "$GAME_USER" ]] || continue
-        runuser -u "$GAME_USER" -- find "$dir" -xdev \( -type d -exec chmod g+rwxs {} + \) -o \( -type f -exec chmod g+rw {} + \) 2>/dev/null || true
-        n=$((n + 1))
+        if (cd / && runuser -u "$GAME_USER" -- find "$dir" -xdev \( -type d -exec chmod g+rwxs {} + \) -o \( -type f -exec chmod g+rw {} + \)) \
+            && [[ $(stat -c %A "$dir") == ?????w[sS]* ]]; then
+            n=$((n + 1))
+        else
+            failed+=("$dir")
+        fi
     done
     (( n == 0 )) || ok "took over $n folder(s) of the old install in $BASE_DIR"
+    (( ${#failed[@]} == 0 )) || warn "could not open these to the agent (see the lines above): ${failed[*]} - the agent can't start them until they are group-writable"
 }
 
 install_depotdownloader() {
@@ -697,7 +703,13 @@ pairing() {
         die "could not make a pairing code: $err"
     fi
     say ""
-    say "  In the panel: Settings -> Machines -> Add machine"
+    if [[ $REPLACE_PHP -eq 1 ]]; then
+        # The panel already knows this machine and its servers: a new entry would leave them behind.
+        say "  In the panel: Settings -> Machines -> Edit on THIS machine's existing entry (not Add machine - its servers"
+        say "  stay with the existing entry). Set the address below and paste the pairing code there."
+    else
+        say "  In the panel: Settings -> Machines -> Add machine"
+    fi
     say "    Address:      https://$addr$port_part   (or a domain name pointing there)"
     say "    Pairing code: $code"
     say ""
