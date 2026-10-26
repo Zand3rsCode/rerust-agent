@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.6 - 2026-10-26
+- Package updates no longer restart the Rust servers. Ubuntu's automatic updates (`needrestart`) restarted every
+  service using an updated library - when zlib was updated, a live Rust server was stopped and started again without
+  warnings or a save. `install.sh` now writes `/etc/needrestart/conf.d/50-rerust-agent.conf` so the game servers and
+  the agent are never restarted that way; they pick up new libraries at their next normal restart. `--uninstall`
+  removes the file. Machines already installed get it by running the installer again (or by adding the file by hand).
+
 ## v0.2.5 - 2026-10-25
 - `install.sh` shows the **public** address for the panel when the machine is behind a router (it showed the
   machine's own private address), and which ports to forward on the router. The public address comes from

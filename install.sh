@@ -16,8 +16,8 @@
 # What it installs: the agent (/opt/rerust-agent, root's), DepotDownloader (/opt/depotdownloader, a pinned version),
 # two users - rerust-agent (the agent) and rerust (the game servers) -, the systemd units rerust-agent.socket +
 # .service, rerust-server@.service (one per Rust server, each sees only its own folder), rerust-agent-update.service
-# (installs signed updates), a polkit rule (the agent may start/stop only its servers' units) and firewall rules
-# (ufw). No PHP, web server, database or certbot. The agent's download is checked against SHA256SUMS, and
+# (installs signed updates), a polkit rule (the agent may start/stop only its servers' units), a needrestart rule
+# (package updates never restart the game servers or the agent) and firewall rules (ufw). No PHP, web server, database or certbot. The agent's download is checked against SHA256SUMS, and
 # SHA256SUMS against the release signature, before anything is installed.
 set -euo pipefail
 
@@ -41,6 +41,7 @@ BASE_DIR=/srv/rust
 DD_DIR=/opt/depotdownloader
 UNIT_DIR=/etc/systemd/system
 POLKIT_RULE=/etc/polkit-1/rules.d/50-rerust-agent.rules
+NEEDRESTART_CONF=/etc/needrestart/conf.d/50-rerust-agent.conf
 AGENT_USER=rerust-agent
 GAME_USER=rerust
 FW_AGENT='ReRust panel -> agent'
@@ -326,6 +327,17 @@ polkit.addRule(function (action, subject) {
 EOF
 }
 
+# needrestart (run by apt and Ubuntu's automatic updates) restarts every service that uses an updated library - it
+# stopped a live Rust server without saving when zlib was updated (2026-10-26). The game servers and the agent are
+# never restarted by it: they pick up new libraries at their next normal restart (the panel's daily restart).
+needrestart_conf() {
+    cat <<'EOF'
+# Written by the ReRust Agent installer - package updates never restart these.
+$nrconf{override_rc}{qr(^rerust-server@.+\.service$)} = 0;
+$nrconf{override_rc}{qr(^rerust-agent\.(service|socket)$)} = 0;
+EOF
+}
+
 # --- uninstall ---------------------------------------------------------------------------------------------------------
 
 uninstall() {
@@ -343,10 +355,10 @@ uninstall() {
     fi
     systemctl disable --now rerust-agent.socket rerust-agent.service >/dev/null 2>&1 || true
     rm -f "$UNIT_DIR/rerust-agent.socket" "$UNIT_DIR/rerust-agent.service" "$UNIT_DIR/rerust-agent-update.service" \
-        "$UNIT_DIR/rerust-server@.service" "$POLKIT_RULE"
+        "$UNIT_DIR/rerust-server@.service" "$POLKIT_RULE" "$NEEDRESTART_CONF"
     systemctl daemon-reload
     systemctl reset-failed 'rerust-server@*' >/dev/null 2>&1 || true
-    ok "removed the services and the polkit rule"
+    ok "removed the services, the polkit rule and the needrestart rule"
     rm -rf "$APP_DIR" "$CFG_DIR" "$STATE_DIR" "$DD_DIR" /run/rerust-agent-update
     ok "removed $APP_DIR, $CFG_DIR, $STATE_DIR, $DD_DIR"
     if command -v ufw >/dev/null; then
@@ -597,7 +609,11 @@ install_services() {
     done
     [[ -d $(dirname "$POLKIT_RULE") ]] || install -d -m 755 "$(dirname "$POLKIT_RULE")"   # never change polkit's own folder
     polkit_rule >"$POLKIT_RULE.new"; chmod 644 "$POLKIT_RULE.new"; mv -f "$POLKIT_RULE.new" "$POLKIT_RULE"
-    ok "wrote rerust-agent.socket/.service, rerust-server@.service, rerust-agent-update.service and the polkit rule"
+    # Also without needrestart installed yet: it reads the folder once it is.
+    [[ -d $(dirname "$NEEDRESTART_CONF") ]] || install -d -m 755 "$(dirname "$NEEDRESTART_CONF")"
+    needrestart_conf >"$NEEDRESTART_CONF.new"; chmod 644 "$NEEDRESTART_CONF.new"; mv -f "$NEEDRESTART_CONF.new" "$NEEDRESTART_CONF"
+    ok "wrote rerust-agent.socket/.service, rerust-server@.service, rerust-agent-update.service, the polkit rule"
+    ok "and the needrestart rule (package updates never restart the game servers or the agent)"
     systemctl daemon-reload
     systemctl enable rerust-agent.socket rerust-agent.service >/dev/null 2>&1
     # Socket first (the port may have changed); game servers are their own units and keep running.
