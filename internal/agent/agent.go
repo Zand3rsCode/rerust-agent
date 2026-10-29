@@ -46,6 +46,9 @@ type Agent struct {
 
 	failMu   sync.Mutex
 	failures map[string][]time.Time
+
+	// leaving: PIDs already logged as "quit, waiting for its last threads" (one journal line each).
+	leaving sync.Map
 }
 
 // New builds the agent (the state folder must exist). sup nil = systemd (tests pass a fake).

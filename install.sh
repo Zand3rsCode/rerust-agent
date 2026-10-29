@@ -256,6 +256,8 @@ Group=$GAME_USER
 ExecStart=$BIN launch --dir $BASE_DIR/%i
 # The panel restarts crashed servers itself (Crash Recovery).
 Restart=no
+# Rust's own "quit" saves and then kills itself (Process.Kill = SIGKILL): a normal end, not a failed unit.
+SuccessExitStatus=SIGKILL
 LimitNOFILE=65535
 UMask=0007
 # Only its own folder: no other server, no backups, nothing of the agent.

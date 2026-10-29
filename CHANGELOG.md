@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.9 - 2026-10-29
+- The agent's journal now has a line for each server start (and a refused one, with the reason), for a start that
+  had to wait for a server still shutting down (and how long), and for each kill - so a failed restart can be read
+  from `journalctl -u rerust-agent`.
+- A Rust server's unit no longer shows as "failed" after every stop: Rust's own `quit` saves and then ends itself with
+  SIGKILL, which the unit now counts as a normal end. Applies once the installer has been run again on the machine.
+
 ## v0.2.8 - 2026-10-29
 - Fix: a daily restart could stop the server and then fail to start it ("The server is already running"). A Rust
   server that quits shows as finished for a moment while its last threads still shut down; the agent reported it as

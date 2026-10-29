@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"sort"
@@ -144,6 +145,9 @@ func (a *Agent) start(s *Server, args []string, carbon bool) (int, error) {
 		return 0, fmt.Errorf("%s is not executable (chmod +x)", Executable)
 	}
 	if pid := a.waitLeaving(s.Slug); pid > 0 {
+		if !running(pid) {
+			log.Printf("%s: the old process %d was still shutting down after %s", s.Slug, pid, LeaveWait)
+		}
 		return 0, fmt.Errorf("the server is already running (process %d)", pid)
 	}
 	if _, err := j.MkdirAll(gameDir); err != nil {
@@ -170,12 +174,18 @@ var LeaveWait = 5 * time.Second
 // in /proc while its other threads still shut down, and systemd keeps it as the unit's process until all of them
 // have ended - a start right after a stop (daily restart) waits for that instead of refusing.
 func (a *Agent) waitLeaving(slug string) int {
-	deadline := time.Now().Add(LeaveWait)
+	began := time.Now()
+	deadline := began.Add(LeaveWait)
+	waited := 0
 	for {
 		pid := a.sup.MainPID(slug)
+		if pid <= 0 && waited > 0 {
+			log.Printf("%s: waited %s for the old process %d to end", slug, time.Since(began).Round(10*time.Millisecond), waited)
+		}
 		if pid <= 0 || running(pid) || !time.Now().Before(deadline) {
 			return pid
 		}
+		waited = pid
 		time.Sleep(250 * time.Millisecond)
 	}
 }
@@ -266,9 +276,11 @@ func (a *Agent) processStart(w http.ResponseWriter, r *http.Request, s *Server) 
 	}
 	pid, err := a.start(s, args, carbon)
 	if err != nil {
+		log.Printf("%s: start refused: %v", s.Slug, err)
 		fail(w, 409, "start_failed", upperFirst(err.Error())+".")
 		return
 	}
+	log.Printf("%s: started (process %d)", s.Slug, pid)
 	writeJSON(w, 200, map[string]any{"pid": pid})
 }
 
@@ -287,6 +299,9 @@ func (a *Agent) info(s *Server, pid int, fresh bool) map[string]any {
 	}
 	// Still the unit's process but a zombie: Rust is shutting down - not gone until systemd lets go of it.
 	if procComm(pid) == commName {
+		if _, seen := a.leaving.LoadOrStore(pid, true); !seen {
+			log.Printf("%s: process %d quit, waiting for its last threads to end", s.Slug, pid)
+		}
 		return map[string]any{"pid": pid, "memory_kb": 0}
 	}
 	return nil
@@ -335,9 +350,11 @@ func (a *Agent) processKill(w http.ResponseWriter, r *http.Request, s *Server) {
 	}
 	// No verified SIGTERM save in Rust: the panel saves over RCON first, then the unit is killed.
 	if err := a.sup.Kill(s.Slug); err != nil {
+		log.Printf("%s: kill of process %d failed: %v", s.Slug, pid, err)
 		fail(w, 409, "not_this_server", upperFirst(err.Error())+".")
 		return
 	}
+	log.Printf("%s: killed (process %d)", s.Slug, pid)
 	writeJSON(w, 200, map[string]any{"killed": true})
 }
 
