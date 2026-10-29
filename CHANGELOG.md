@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.8 - 2026-10-29
+- Fix: a daily restart could stop the server and then fail to start it ("The server is already running"). A Rust
+  server that quits shows as finished for a moment while its last threads still shut down; the agent reported it as
+  stopped while systemd still held it. The agent now reports it as running until systemd has let go, and a start waits
+  a few seconds for a server that is still shutting down.
+- The update status no longer stays at "installing" after a reboot when the new version is already running.
+
 ## v0.2.7 - 2026-10-26
 - Fix: `--replace-php-agent` said "took over N folder(s)" but changed nothing when run from `/root` (the usual place):
   the step runs as the game's user, which can't enter `/root`, so it stopped at once - and its error was hidden. The

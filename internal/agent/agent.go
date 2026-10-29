@@ -62,6 +62,7 @@ func New(version string, cfg config.Config, store *auth.Store, stats *sysstats.S
 		return nil, err
 	}
 	a.update = newUpdater(a)
+	a.update.settle()
 	a.routes()
 	return a, nil
 }

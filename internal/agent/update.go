@@ -181,6 +181,23 @@ func (u *updater) save(run updateRun) {
 	_ = config.WriteAtomic(u.statePath(), raw, 0o600)
 }
 
+// settle (at start): the root step's own status lives in /run and is gone after a reboot, so an update that reached
+// "installing" kept saying so for good. When this program is the version that update installed, it is done.
+func (u *updater) settle() {
+	raw, err := os.ReadFile(u.statePath())
+	if err != nil {
+		return
+	}
+	var run updateRun
+	if json.Unmarshal(raw, &run) != nil || (run.State != "installing" && run.State != "downloading") {
+		return
+	}
+	if run.To != "" && run.To == strings.TrimPrefix(u.a.Version, "v") {
+		run.State, run.Message = "done", ""
+		u.save(run)
+	}
+}
+
 type release struct {
 	Tag    string `json:"tag_name"`
 	Assets []struct {

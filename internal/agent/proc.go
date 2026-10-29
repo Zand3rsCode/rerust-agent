@@ -143,7 +143,7 @@ func (a *Agent) start(s *Server, args []string, carbon bool) (int, error) {
 	} else if info.Mode()&0o111 == 0 {
 		return 0, fmt.Errorf("%s is not executable (chmod +x)", Executable)
 	}
-	if pid := a.sup.MainPID(s.Slug); pid > 0 {
+	if pid := a.waitLeaving(s.Slug); pid > 0 {
 		return 0, fmt.Errorf("the server is already running (process %d)", pid)
 	}
 	if _, err := j.MkdirAll(gameDir); err != nil {
@@ -160,6 +160,24 @@ func (a *Agent) start(s *Server, args []string, carbon bool) (int, error) {
 	}
 	recordStart(s, args)
 	return pid, nil
+}
+
+// LeaveWait is how long a start waits for a server that is still shutting down - short: the panel gives the whole
+// start call 10 s and tries again itself. A variable only for tests.
+var LeaveWait = 5 * time.Second
+
+// waitLeaving returns the unit's running process, 0 when there is none. A RustDedicated that quit shows as a zombie
+// in /proc while its other threads still shut down, and systemd keeps it as the unit's process until all of them
+// have ended - a start right after a stop (daily restart) waits for that instead of refusing.
+func (a *Agent) waitLeaving(slug string) int {
+	deadline := time.Now().Add(LeaveWait)
+	for {
+		pid := a.sup.MainPID(slug)
+		if pid <= 0 || running(pid) || !time.Now().Before(deadline) {
+			return pid
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 // recordStart keeps the arguments of the last start (without the RCON password) in the agent's own folder.
@@ -264,7 +282,14 @@ func (a *Agent) info(s *Server, pid int, fresh bool) map[string]any {
 			return map[string]any{"pid": pid, "memory_kb": p.MemBytes / 1024}
 		}
 	}
-	return rustInfo(pid)
+	if info := rustInfo(pid); info != nil || !fresh {
+		return info
+	}
+	// Still the unit's process but a zombie: Rust is shutting down - not gone until systemd lets go of it.
+	if procComm(pid) == commName {
+		return map[string]any{"pid": pid, "memory_kb": 0}
+	}
+	return nil
 }
 
 func (a *Agent) processInfo(w http.ResponseWriter, r *http.Request, s *Server) {
