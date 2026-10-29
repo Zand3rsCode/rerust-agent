@@ -61,6 +61,20 @@ var restartAgent = func() ([]byte, error) {
 // installUpdate replaces the program at self (the running root step's own file).
 func installUpdate(stateDir, selfVersion, self string, status func(state, msg, to string)) error {
 	dir := UpdateDir(stateDir)
+	// The update folder belongs to the agent user: it must be a real folder, and the files are removed through a
+	// handle on exactly that folder - never through a link to another one (SECURITY.md R14).
+	st, err := os.Lstat(dir)
+	if err != nil || !st.IsDir() {
+		return errors.New("the update folder is missing or is not a real folder")
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if here, err := root.Stat("."); err != nil || !os.SameFile(st, here) {
+		return errors.New("the update folder changed while it was being opened")
+	}
 	sums, err := readNoFollow(dir+"/SHA256SUMS", 1<<16)
 	if err != nil {
 		return err
@@ -112,7 +126,7 @@ func installUpdate(stateDir, selfVersion, self string, status func(state, msg, t
 		return err
 	}
 	for _, name := range []string{"SHA256SUMS", "SHA256SUMS.sig", Asset()} {
-		_ = os.Remove(dir + "/" + name)
+		_ = root.Remove(name)
 	}
 	status("done", "Installed v"+version+" - the agent restarts (game servers keep running).", version)
 	if out, err := restartAgent(); err != nil {

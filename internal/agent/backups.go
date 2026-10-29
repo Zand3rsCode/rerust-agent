@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"syscall"
@@ -69,10 +70,15 @@ func (a *Agent) backup(s *Server, framework string, log func(string)) (string, i
 	sources = append(sources, HarmonyFolders...)
 	name := s.Slug + "-" + time.Now().Format("20060102-150405") + ".zip"
 	file := target + "/" + name
-	out, err := os.OpenFile(file, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	// Written under a part name and linked to its real name only when complete (SECURITY.md R7): an agent restart
+	// mid-backup must not leave a half zip that is listed - and could push good backups out.
+	removeStaleParts(target, ".backup-")
+	part := target + "/.backup-" + randomHex(8) + ".part"
+	out, err := os.OpenFile(part, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return "", 0, fmt.Errorf("could not create %s", file)
 	}
+	defer os.Remove(part)
 	zw := zip.NewWriter(out)
 	zw.RegisterCompressor(zip.Deflate, func(w io.Writer) (io.WriteCloser, error) { return flate.NewWriter(w, 1) }) // fast; saves are large
 	count, skipped, saves := 0, 0, 0
@@ -127,8 +133,10 @@ func (a *Agent) backup(s *Server, framework string, log func(string)) (string, i
 		walkErr = err
 	}
 	if walkErr != nil {
-		_ = os.Remove(file)
 		return "", 0, errors.New("writing the backup failed (disk full?)")
+	}
+	if err := os.Link(part, file); err != nil { // never replaces an existing name
+		return "", 0, fmt.Errorf("could not create %s", file)
 	}
 	if saves == 0 {
 		log("WARNING: the save folder has no world save (.sav) - this backup holds no world (e.g. a freshly wiped server).")
@@ -140,6 +148,19 @@ func (a *Agent) backup(s *Server, framework string, log func(string)) (string, i
 	}
 	log(fmt.Sprintf("Backup: %d files, %.1f MB%s -> %s", count, float64(size)/1048576, extra, file))
 	return name, size, nil
+}
+
+// removeStaleParts deletes part files (prefix + ... + .part) older than an hour - left by a crash or restart.
+func removeStaleParts(dir, prefix string) {
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if !e.Type().IsRegular() || !strings.HasPrefix(e.Name(), prefix) || !strings.HasSuffix(e.Name(), ".part") {
+			continue
+		}
+		if info, err := e.Info(); err == nil && time.Since(info.ModTime()) > time.Hour {
+			_ = os.Remove(dir + "/" + e.Name())
+		}
+	}
 }
 
 /* ---------- list / download / delete ---------- */
@@ -224,6 +245,38 @@ func rootOf(rel string) string {
 // (HarmonyMods_Data is the mods' settings/data: restored always).
 func isCodeRoot(root string) bool {
 	return root == "HarmonyMods" || strings.HasSuffix(root, "/plugins") || strings.HasSuffix(root, "/plugins-disabled")
+}
+
+// Admin rights inside the restored folders - only restored with code = true (SECURITY.md R5): Rust runs every line
+// of cfg/users.cfg, bans.cfg and serverauto.cfg on start (ownerid ..., any command), and the frameworks' permission
+// files grant plugin rights. Without code the server keeps its current ones.
+var (
+	rightsInSave = []string{"cfg"}
+	rightsInData = []string{"oxide.users.data", "oxide.groups.data"}
+)
+
+// isRights: an admin-rights file or folder (rel as in the zip).
+func isRights(rel string) bool {
+	root := rootOf(rel)
+	if root == "" {
+		return false
+	}
+	rest := strings.TrimPrefix(rel, root+"/")
+	if strings.HasPrefix(root, "server/") {
+		return slices.Contains(rightsInSave, strings.SplitN(rest, "/", 2)[0])
+	}
+	return strings.HasSuffix(root, "/data") && slices.Contains(rightsInData, strings.ToLower(rest))
+}
+
+// rightsIn: the rights names inside a restored folder.
+func rightsIn(root string) []string {
+	if strings.HasPrefix(root, "server/") {
+		return rightsInSave
+	}
+	if strings.HasSuffix(root, "/data") {
+		return rightsInData
+	}
+	return nil
 }
 
 // codeRootOf is the framework folder (or a Harmony folder) an entry is in.
@@ -390,26 +443,31 @@ func (a *Agent) restore(s *Server, name string, code bool, log func(string)) (an
 		}
 		log(fmt.Sprintf("Skipped %d file(s) outside the folders a backup restores: %s%s", info.SkippedCount, strings.Join(info.Skipped, ", "), more))
 	}
-	entries, _ := j.ReadDir("")
-	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), stagingPrefix) {
-			_ = j.RemoveAll(e.Name()) // left behind by a crash
-		}
-	}
+	recoverStaging(j, log)
 	staging := stagingPrefix + randomHex(4)
-	defer func() { _ = j.RemoveAll(staging) }()
+	keep := false
+	defer func() {
+		if !keep { // never while it holds the only copy of the old folders (SECURITY.md R4)
+			_ = j.RemoveAll(staging)
+		}
+	}()
 	wanted := map[string]bool{}
 	for _, r := range roots {
 		wanted[r] = true
 	}
-	if _, err := extractZip(path, j, staging+"/new", func(rel string) bool { return !wanted[rootOf(rel)] }, RestoreMaxBytes, RestoreMaxEntries); err != nil {
+	skip := func(rel string) bool { return !wanted[rootOf(rel)] || (!code && isRights(rel)) }
+	if _, err := extractZip(path, j, staging+"/new", skip, RestoreMaxBytes, RestoreMaxEntries); err != nil {
 		return nil, err
 	}
-	restored, err := swapIn(j, staging, roots, s.SafeIdentity())
+	restored, kept, err := swapIn(j, staging, roots, s.SafeIdentity(), code)
+	keep = kept
 	if err != nil {
 		return nil, err
 	}
 	log("Restored: " + strings.Join(restored, ", ") + ".")
+	if !code {
+		log("Kept the server's current admin rights (cfg folder, permission files) - restored only with plugins and HarmonyMods.")
+	}
 	return map[string]any{
 		"restored": restored, "files": info.Files, "bytes": info.Bytes, "left_out": leftOut,
 		"skipped": info.Skipped, "skipped_count": info.SkippedCount, "map": info.Map,
@@ -427,7 +485,8 @@ func refuseLinks(j *jail.Jail, rel string) error {
 	return nil
 }
 
-func swapIn(j *jail.Jail, staging string, roots []string, identity string) ([]string, error) {
+// swapIn returns keep = true when a rollback could not put every old folder back: staging/old then holds the only copy.
+func swapIn(j *jail.Jail, staging string, roots []string, identity string, code bool) ([]string, bool, error) {
 	type step struct {
 		current, old string
 		hadOld       bool
@@ -446,6 +505,11 @@ func swapIn(j *jail.Jail, staging string, roots []string, identity string) ([]st
 			}
 			_, lerr := j.Lstat(current)
 			hadOld := lerr == nil
+			if hadOld && !code {
+				if err := keepRights(j, current, fresh, rightsIn(root)); err != nil {
+					return err
+				}
+			}
 			if hadOld {
 				if _, err := j.MkdirAll(parentOf(old)); err != nil {
 					return err
@@ -466,18 +530,116 @@ func swapIn(j *jail.Jail, staging string, roots []string, identity string) ([]st
 		return nil
 	}()
 	if err != nil {
+		var lost []string
 		for i := len(done) - 1; i >= 0; i-- {
 			st := done[i]
 			if _, e := j.Lstat(st.current); e == nil {
 				_ = j.RemoveAll(st.current)
 			}
-			if st.hadOld {
-				_ = j.Rename(st.old, st.current)
+			if st.hadOld && j.Rename(st.old, st.current) != nil {
+				lost = append(lost, st.old)
 			}
 		}
-		return nil, fmt.Errorf("restore failed, nothing was changed: %v", err)
+		if len(lost) > 0 {
+			return nil, true, fmt.Errorf("restore failed and the old folders could not all be put back - they are kept in %s (move them back by hand): %v", strings.Join(lost, ", "), err)
+		}
+		return nil, false, fmt.Errorf("restore failed, nothing was changed: %v", err)
 	}
-	return restored, nil
+	return restored, false, nil
+}
+
+// keepRights copies the server's current rights into the unpacked folder before the swap, so they stay. Copied,
+// never moved: a rollback deletes the unpacked folder. Links are never followed or copied.
+func keepRights(j *jail.Jail, current, fresh string, names []string) error {
+	for _, n := range names {
+		if err := copyTree(j, current+"/"+n, fresh+"/"+n); err != nil {
+			return fmt.Errorf("could not keep %s: %v", n, err)
+		}
+	}
+	return nil
+}
+
+func copyTree(j *jail.Jail, from, to string) error {
+	st, err := j.Lstat(from)
+	if err != nil || st.Mode()&fs.ModeSymlink != 0 {
+		return nil
+	}
+	if st.Mode().IsRegular() {
+		data, _, err := j.ReadRegular(from, 64<<20) // cfg files and permission data: small
+		if err != nil {
+			return err
+		}
+		if _, err := j.MkdirAll(parentOf(to)); err != nil {
+			return err
+		}
+		return j.WriteAtomic(to, data, 0o640)
+	}
+	if !st.IsDir() {
+		return nil
+	}
+	if _, err := j.MkdirAll(to); err != nil {
+		return err
+	}
+	entries, err := j.ReadDir(from)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if err := copyTree(j, from+"/"+e.Name(), to+"/"+e.Name()); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// recoverStaging handles staging folders a crash left behind. One may hold the only copy of a folder (crashed
+// between moving the current folder aside and putting the restored one in): whatever is missing is put back, and a
+// staging folder with anything still in old/ is kept (SECURITY.md R4) - deleting it could lose the server's data.
+func recoverStaging(j *jail.Jail, log func(string)) {
+	entries, _ := j.ReadDir("")
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, stagingPrefix) || !e.IsDir() || j.IsLink(name) {
+			continue
+		}
+		old := name + "/old"
+		if j.IsDir(old) {
+			for _, target := range oldRoots(j, old) {
+				if _, err := j.Lstat(target); err != nil {
+					if _, err := j.MkdirAll(parentOf(target)); err == nil && j.Rename(old+"/"+target, target) == nil {
+						log("Put back " + target + " from an earlier restore that did not finish.")
+					}
+				}
+			}
+			if len(oldRoots(j, old)) > 0 {
+				log("Kept " + name + " - it holds folders from an earlier restore that did not finish (check them, then delete it).")
+				continue
+			}
+		}
+		_ = j.RemoveAll(name)
+	}
+}
+
+// oldRoots: the folders inside a staging old/ (server/<id>, oxide/data, HarmonyMods ...).
+func oldRoots(j *jail.Jail, old string) []string {
+	var found []string
+	firsts, _ := j.ReadDir(old)
+	for _, f := range firsts {
+		if !f.IsDir() || j.IsLink(old+"/"+f.Name()) {
+			continue
+		}
+		if f.Name() == "server" || f.Name() == "oxide" || f.Name() == "carbon" {
+			seconds, _ := j.ReadDir(old + "/" + f.Name())
+			for _, sub := range seconds {
+				if !j.IsLink(old + "/" + f.Name() + "/" + sub.Name()) {
+					found = append(found, f.Name()+"/"+sub.Name())
+				}
+			}
+			continue
+		}
+		found = append(found, f.Name())
+	}
+	return found
 }
 
 /* ---------- uploads (a backup sent here in chunks) ---------- */

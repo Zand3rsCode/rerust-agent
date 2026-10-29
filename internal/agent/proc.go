@@ -274,6 +274,11 @@ func (a *Agent) processStart(w http.ResponseWriter, r *http.Request, s *Server) 
 		invalid(w, "args (a list of strings) and carbon (true/false) are required.")
 		return
 	}
+	// Never while a job works on the server's files (an install writes by path - game code must not run meanwhile).
+	if j := a.jobs.busy(s.Slug); j != nil {
+		fail(w, 409, "busy", fmt.Sprintf("A %s is still running for this server - start it when that has finished.", j.Type))
+		return
+	}
 	pid, err := a.start(s, args, carbon)
 	if err != nil {
 		log.Printf("%s: start refused: %v", s.Slug, err)

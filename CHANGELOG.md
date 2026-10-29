@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.3.0 - 2026-10-29
+Security and reliability review.
+- **Restore:** a backup no longer brings in its `cfg/` folder (owners, moderators, bans) or the frameworks' permission
+  files unless the panel asks for plugins/HarmonyMods/admin rights (`code`). A restore that fails or crashes halfway
+  never deletes the only copy of the server's folders: they are put back, or kept and named.
+- **Backups** are written under a temporary name and appear only when complete - a restart mid-backup no longer
+  leaves a half zip in the list.
+- The agent **refuses to update itself while a job runs**, and **refuses to start a server while a job works on it**
+  (an update used to end a running restore).
+- Taking over a folder reads its `server.cfg` safely (a FIFO or link swapped in can no longer hang the agent or make it
+  read its own files).
+- The root update step only works on a real update folder (never through a link).
+- `.rerust/home` being a link no longer hides other links from the pre-install check.
+
 ## v0.2.9 - 2026-10-29
 - The agent's journal now has a line for each server start (and a refused one, with the reason), for a start that
   had to wait for a server still shutting down (and how long), and for each kill - so a failed restart can be read

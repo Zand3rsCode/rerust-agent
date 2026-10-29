@@ -230,6 +230,11 @@ var errUpToDate = errors.New("up to date")
 // its own program (it belongs to root) - so a game server can't either.
 func (a *Agent) startUpdate(w http.ResponseWriter, r *http.Request) {
 	u := a.update
+	// The update restarts the agent, which ends every running job - a restore cut off mid-swap (SECURITY.md R7).
+	if j := a.jobs.anyBusy(); j != nil {
+		fail(w, 409, "busy", fmt.Sprintf("A %s is running for %s on this machine - update when it has finished.", j.Type, j.Slug))
+		return
+	}
 	u.mu.Lock()
 	if u.busy {
 		u.mu.Unlock()

@@ -184,7 +184,13 @@ func (a *Agent) folderInspect(w http.ResponseWriter, r *http.Request) {
 	}
 	identities := []map[string]any{}
 	serverDir := path + "/server"
-	if jail.IsDir(serverDir) && !jail.IsLink(serverDir) {
+	// server.cfg is read through the jail (SECURITY.md R6): checked on the open handle, so a plugin swapping in a
+	// FIFO, /dev/zero or a link after a check can't hang the agent or make it read its own files.
+	j, jerr := jail.Open(path)
+	if jerr == nil {
+		defer j.Close()
+	}
+	if jerr == nil && jail.IsDir(serverDir) && !jail.IsLink(serverDir) {
 		items, _ := os.ReadDir(serverDir)
 		for _, item := range items {
 			if len(identities) >= maxIdentities {
@@ -195,9 +201,9 @@ func (a *Agent) folderInspect(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			var cfg any
-			cfgPath := sub + "/cfg/server.cfg"
-			if !jail.IsLink(sub+"/cfg") && !jail.IsLink(cfgPath) && jail.IsFile(cfgPath) && fileSize(cfgPath) <= maxCfgBytes {
-				if raw, err := os.ReadFile(cfgPath); err == nil {
+			rel := "server/" + item.Name() + "/cfg/server.cfg"
+			if !j.IsLink("server/"+item.Name()+"/cfg") && !j.IsLink(rel) {
+				if raw, _, err := j.ReadRegular(rel, maxCfgBytes); err == nil {
 					cfg = string(raw)
 				}
 			}

@@ -144,8 +144,8 @@ func (a *Agent) readyForFiles(s *Server) error {
 		if err != nil {
 			return nil
 		}
-		if p == gameDir+"/home" {
-			return fs.SkipDir // Steam's own links for the game's HOME
+		if p == gameDir+"/home" && d.IsDir() {
+			return fs.SkipDir // Steam's own links for the game's HOME (a link there is reported like any other)
 		}
 		if d.Type()&fs.ModeSymlink != 0 && len(links) < 10 {
 			links = append(links, p)

@@ -178,6 +178,18 @@ func (m *jobs) busy(slug string) *Job {
 	return nil
 }
 
+// anyBusy is any server's active job (an install, backup, restore ...), if one runs.
+func (m *jobs) anyBusy() *Job {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, j := range m.all {
+		if j.State == Queued || j.State == Running {
+			return j
+		}
+	}
+	return nil
+}
+
 func (m *jobs) get(slug string, id int64) *Job {
 	m.mu.Lock()
 	defer m.mu.Unlock()
